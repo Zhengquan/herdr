@@ -752,21 +752,24 @@ pub(crate) fn install_workbuddy() -> io::Result<WorkbuddyInstallPaths> {
     // install ran. We still (re)spawn the bridge so a restarted server picks
     // up a fresh watcher process — but we avoid creating a second "WorkBuddy"
     // workspace when one already exists.
-    let bridge_pane = spawn_workbuddy_bridge(&watch_path);
+    let (bridge_pane, bridge_reused) = spawn_workbuddy_bridge(&watch_path)
+        .map(|(pane, reused)| (Some(pane), reused))
+        .unwrap_or((None, false));
 
     Ok(WorkbuddyInstallPaths {
         watch_path,
         bridge_pane,
+        bridge_reused,
     })
 }
 
 /// Best-effort bridge startup. Idempotent: looks for an existing workspace
 /// labeled "WorkBuddy" and reuses its root pane (re-injecting the watcher
 /// command so a restarted server gets a fresh watcher process); only creates
-/// a new workspace when none exists. Returns the bridge pane id when a
+/// a new workspace when none exists. Returns `(pane_id, reused)` when a
 /// running Herdr server accepted the spawn. Never fails the install.
 #[cfg(not(windows))]
-fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<String> {
+fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<(String, bool)> {
     use crate::api::schema::{
         EmptyParams, Method, PaneListParams, PaneSendInputParams, Request, ResponseResult,
         WorkspaceCreateParams,
@@ -797,7 +800,7 @@ fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<String> {
         .into_iter()
         .find(|workspace| workspace.label == "WorkBuddy");
 
-    let pane_id = if let Some(workspace) = existing {
+    let spawn_result = if let Some(workspace) = existing {
         // Reuse the existing workspace's root pane. List panes in that
         // workspace and pick the first one.
         let panes = client
@@ -841,6 +844,7 @@ fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<String> {
                 };
                 panes.into_iter().next().map(|pane| pane.pane_id)
             })
+            .map(|pane_id| (pane_id, true))
     } else {
         // No existing WorkBuddy workspace; create one.
         let created = client
@@ -857,13 +861,13 @@ fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<String> {
         let ResponseResult::WorkspaceCreated { root_pane, .. } = created.result else {
             return None;
         };
-        Some(root_pane.pane_id)
+        Some((root_pane.pane_id, false))
     };
 
     // If we still don't have a pane id, the workspace exists but has no pane.
     // Re-creating the workspace via WorkspaceFocus above may have produced one
     // on focus; bail out gracefully in that rare case.
-    let pane_id = pane_id?;
+    let (pane_id, reused) = spawn_result?;
 
     // (Re-)inject the watcher command into the pane so a freshly restarted
     // server runs the latest watcher script.
@@ -878,11 +882,11 @@ fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<String> {
         })
         .ok()?;
 
-    Some(pane_id)
+    Some((pane_id, reused))
 }
 
 #[cfg(windows)]
-fn spawn_workbuddy_bridge(_watch_path: &Path) -> Option<String> {
+fn spawn_workbuddy_bridge(_watch_path: &Path) -> Option<(String, bool)> {
     None
 }
 

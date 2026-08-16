@@ -296,6 +296,9 @@ pub(crate) struct WorkbuddyInstallPaths {
     /// Pane id of the auto-spawned bridge pane, when a Herdr server was
     /// reachable at install time.
     pub bridge_pane: Option<String>,
+    /// True when the bridge pane was reused from an existing "WorkBuddy"
+    /// workspace rather than freshly created.
+    pub bridge_reused: bool,
 }
 
 #[derive(Debug)]

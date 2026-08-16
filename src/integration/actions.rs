@@ -274,11 +274,14 @@ fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Re
                 "installed workbuddy bridge watcher to {}",
                 installed.watch_path.display()
             )];
-            match installed.bridge_pane {
-                Some(pane_id) => messages.push(format!(
+            match (installed.bridge_pane, installed.bridge_reused) {
+                (Some(pane_id), true) => messages.push(format!(
+                    "restarted workbuddy bridge in pane {pane_id} of the existing \"WorkBuddy\" workspace"
+                )),
+                (Some(pane_id), false) => messages.push(format!(
                     "started workbuddy bridge in pane {pane_id} of the new \"WorkBuddy\" workspace"
                 )),
-                None => messages.push(format!(
+                (None, _) => messages.push(format!(
                     "no running herdr server found; start the bridge later by running `sh {}` inside any herdr pane",
                     installed.watch_path.display()
                 )),
