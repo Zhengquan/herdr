@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add customizations beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=workbuddy
-# HERDR_INTEGRATION_VERSION=3
+# HERDR_INTEGRATION_VERSION=4
 #
 # WorkBuddy is a standalone macOS desktop app: it never runs inside a Herdr
 # pane, so process detection and screen manifests cannot observe it. This
@@ -44,6 +44,22 @@ db_path = os.environ["HERDR_WORKBUDDY_DB"]
 state_file = os.environ["HERDR_WORKBUDDY_STATE_FILE"]
 workbuddy_home = os.environ["HERDR_WORKBUDDY_HOME"]
 
+NOW = time.time()
+NOW_MS = NOW * 1000
+
+# ---------------------------------------------------------------------------
+# Tunables. All time windows are chosen to be longer than WorkBuddy's ~1s
+# engine heartbeat cadence and its ~3-10s background-writer cadence, so that
+# routine bookkeeping never registers as task execution.
+# ---------------------------------------------------------------------------
+ENGINE_LIVE_S = 12          # a non-prewarm engine heartbeat this fresh = a host is alive
+WORKING_UPDATED_S = 15      # a working row whose updated_at is this fresh = actively executing
+FAILED_RECENT_MS = 30 * 60_000
+ENTER_WORKING_POLLS = 1     # confirmations required to ENTER working (report quickly)
+LEAVE_WORKING_POLLS = 3     # confirmations required to LEAVE working (absorb writer blips)
+GENERIC_POLLS = 2           # confirmations for any other transition
+
+
 def send(method, params):
     request_id = f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}"
     request = {"id": request_id, "method": method, "params": params}
@@ -60,37 +76,41 @@ def send(method, params):
     except Exception:
         pass
 
+
 def load_sessions():
-    """Return (error_message_or_None, rows) from WorkBuddy's session database."""
+    """Return (error_or_None, rows) where each row is
+    (status, title, last_activity_at, updated_at)."""
     if not os.path.isfile(db_path):
         return ("WorkBuddy database not found", [])
     try:
         db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         rows = db.execute(
-            "SELECT status, title, last_activity_at FROM sessions "
+            "SELECT status, title, last_activity_at, updated_at FROM sessions "
             "WHERE deleted_at IS NULL AND status != 'archived' "
-            "ORDER BY last_activity_at DESC LIMIT 20"
+            "ORDER BY updated_at DESC LIMIT 20"
         ).fetchall()
         db.close()
         return (None, rows)
     except Exception:
         return ("WorkBuddy database unreadable", [])
 
-# Liveness comes from the engine process descriptors in ~/.workbuddy/sessions/:
-# each actively executing session spawns a host-cli engine that rewrites its
-# <pid>.json heartbeat about every second. The heartbeat stops when execution
-# finishes, even though sessions.status stays 'working' in the database — so
-# heartbeat freshness, not the status field, is the real "is it running"
-# signal. A long tool call keeps heartbeating, so this covers long builds.
-ENGINE_LIVE_S = 20
-# A failed session only holds the bridge in blocked while it is recent;
-# otherwise an old failure would pin the state forever.
-FAILED_RECENT_MS = 30 * 60_000
 
 def engine_live():
-    """True while any WorkBuddy engine process is heartbeating."""
+    """True while a *task-executing* WorkBuddy engine is heartbeating.
+
+    Each session spawns a host-cli engine that rewrites its <pid>.json
+    heartbeat about once a second. Two kinds of engine must NOT count as a
+    running task, or the bridge fires phantom completion sounds:
+
+      * prewarm pool workers (kind == "prewarm"): idle engines kept warm for
+        fast session startup. They refresh on a timer while executing nothing.
+      * any descriptor whose meta.status is "idle".
+
+    Only a fresh heartbeat from a non-prewarm, non-idle engine is treated as a
+    live host. Host liveness alone is still not "a task is running" — that is
+    decided in aggregate() together with the database — but it gates it.
+    """
     sessions_dir = os.path.join(workbuddy_home, "sessions")
-    now = time.time()
     try:
         names = os.listdir(sessions_dir)
     except Exception:
@@ -98,38 +118,67 @@ def engine_live():
     for name in names:
         if not name.endswith(".json"):
             continue
+        path = os.path.join(sessions_dir, name)
         try:
-            if now - os.path.getmtime(os.path.join(sessions_dir, name)) < ENGINE_LIVE_S:
-                return True
+            if NOW - os.path.getmtime(path) >= ENGINE_LIVE_S:
+                continue
         except OSError:
             continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            # Fresh but unreadable: be conservative and ignore it rather than
+            # letting an unknown descriptor pin the state to working.
+            continue
+        if str(data.get("kind", "")).lower() == "prewarm":
+            continue
+        meta = data.get("meta") or {}
+        if str(meta.get("status", "")).lower() == "idle":
+            continue
+        return True
     return False
 
+
 def aggregate(rows, error, live):
-    """Return (state, message) for herdr reporting."""
+    """Return (state, message).
+
+    Working requires BOTH signals to agree:
+      * the database has a session whose status == 'working' with a fresh
+        updated_at (an engine is actively writing to it), AND
+      * a non-prewarm engine is heartbeating (engine_live()).
+
+    Requiring both eliminates the two historical failure modes: a stuck
+    'working' status with no live engine (no phantom working), and a live but
+    idle prewarm engine with no working row (no phantom sound).
+    """
     if error:
         return ("idle", error)
-    now = time.time() * 1000
 
-    def age_ms(row):
+    def age_ms(value):
         try:
-            return now - int(row[2])
+            return NOW_MS - int(value)
         except Exception:
             return float("inf")
 
-    if live:
-        # An engine is heartbeating: something is executing right now. The
-        # database status lags behind reality in both directions, so the
-        # heartbeat wins; take the title from the most recent session.
-        title = next(
-            (str(r[1]) for r in rows if str(r[0]).lower() == "working" and r[1]),
-            str(rows[0][1]) if rows and rows[0][1] else "task",
-        )
+    working_row = next(
+        (
+            r
+            for r in rows
+            if str(r[0]).lower() == "working"
+            and age_ms(r[3]) < WORKING_UPDATED_S * 1000
+        ),
+        None,
+    )
+    if live and working_row is not None:
+        title = str(working_row[1] or "task")
         return ("working", title[:120])
 
     failed = [
-        r for r in rows
-        if str(r[0]).lower() in ("error", "failed") and age_ms(r) < FAILED_RECENT_MS
+        r
+        for r in rows
+        if str(r[0]).lower() in ("error", "failed")
+        and age_ms(r[2]) < FAILED_RECENT_MS
     ]
     if failed:
         return ("blocked", f"task failed: {str(failed[0][1] or 'task')[:110]}")
@@ -138,56 +187,209 @@ def aggregate(rows, error, live):
         return ("idle", str(rows[0][1])[:120])
     return ("idle", None)
 
+
+# ===========================================================================
+# Dashboard rendering
+# ===========================================================================
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+DIM = "\x1b[2m"
+
+
+def fg(code):
+    return f"\x1b[38;5;{code}m"
+
+
+def bg(code):
+    return f"\x1b[48;5;{code}m"
+
+
+# Palette (256-color, renders on any modern terminal).
+C_ACCENT = 39     # cyan-blue brand accent
+C_ACCENT2 = 45    # lighter cyan
+C_GREEN = 42
+C_RED = 203
+C_AMBER = 214
+C_MUTE = 244
+C_FAINT = 240
+C_TEXT = 252
+
+STATE_THEME = {
+    "working": (C_GREEN, "RUNNING", "▶"),
+    "blocked": (C_RED, "BLOCKED", "■"),
+    "idle": (C_MUTE, "IDLE", "◇"),
+}
+
+
 def fmt_ts(ms):
     try:
         return time.strftime("%H:%M", time.localtime(int(ms) / 1000))
     except Exception:
         return "--:--"
 
+
+def fmt_age(ms):
+    try:
+        secs = max(0, int((NOW_MS - int(ms)) / 1000))
+    except Exception:
+        return ""
+    if secs < 60:
+        return f"{secs}s ago"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+import unicodedata
+
+
+def dwidth(text):
+    """Display width in terminal columns. CJK / wide glyphs count as 2."""
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def dtrunc(text, limit):
+    """Truncate text to at most `limit` display columns, appending '…'."""
+    if dwidth(text) <= limit:
+        return text
+    out = []
+    used = 0
+    budget = max(0, limit - 1)  # reserve a column for the ellipsis
+    for ch in text:
+        w = 0 if unicodedata.combining(ch) else (
+            2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        )
+        if used + w > budget:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+WIDTH = 72
+
+
+def rule(left, right=""):
+    inner = WIDTH - 2
+    pad = inner - len(left) - len(right)
+    if pad < 1:
+        pad = 1
+    return f"{left}{' ' * pad}{right}"
+
+
 def render_dashboard(state, rows, error, live):
-    """Redraw the pane as a live task list."""
-    green, red, dim, bold, reset = (
-        "\x1b[32m", "\x1b[31m", "\x1b[2m", "\x1b[1m", "\x1b[0m",
-    )
-    state_color = {"working": green, "blocked": red}.get(state, dim)
-    engine = f"{green}engine live{reset}" if live else f"{dim}engine idle{reset}"
+    color, label, glyph = STATE_THEME.get(state, STATE_THEME["idle"])
+    accent = fg(C_ACCENT)
+    a2 = fg(C_ACCENT2)
+    text = fg(C_TEXT)
+    mute = fg(C_MUTE)
+    faint = fg(C_FAINT)
+
+    top = f"{accent}╭{'─' * (WIDTH - 2)}╮{RESET}"
+    bot = f"{accent}╰{'─' * (WIDTH - 2)}╯{RESET}"
+
+    def row(content_visible, content_ansi):
+        pad = (WIDTH - 2) - content_visible
+        if pad < 0:
+            pad = 0
+        return f"{accent}│{RESET}{content_ansi}{' ' * pad}{accent}│{RESET}"
+
+    # Header line: brand + engine dot + clock.
+    dot = f"{fg(C_GREEN)}●{RESET}" if live else f"{faint}○{RESET}"
+    engine_txt = "engine live" if live else "engine idle"
+    clock = time.strftime("%H:%M:%S")
+    left_v = f"  WorkBuddy  bridge"
+    left_a = f"  {BOLD}{a2}WorkBuddy{RESET}{mute}  bridge{RESET}"
+    right_v = f"{engine_txt}  {clock}  "
+    right_a = f"{dot} {mute}{engine_txt}{RESET}  {faint}{clock}{RESET}  "
+    mid_pad = (WIDTH - 2) - dwidth(left_v) - dwidth(right_v)
+    if mid_pad < 1:
+        mid_pad = 1
+    header_a = left_a + (" " * mid_pad) + right_a
+    header_v = left_v + (" " * mid_pad) + right_v
+
+    # Status badge line.
+    badge_v = f"  {glyph} {label} "
+    badge_a = f"  {bg(color)}{fg(16)}{BOLD} {glyph} {label} {RESET}"
     lines = [
-        f"{bold}WorkBuddy{reset}  {state_color}{state.upper()}{reset}  "
-        f"{engine}  {dim}updated {time.strftime('%H:%M:%S')}{reset}",
-        "",
+        top,
+        row(dwidth(header_v), header_a),
+        f"{accent}├{'─' * (WIDTH - 2)}┤{RESET}",
+        row(dwidth(badge_v), badge_a),
+        row(0, ""),
     ]
+
     if error:
-        lines.append(f"{dim}{error}{reset}")
+        emsg = dtrunc(str(error), WIDTH - 6)
+        lines.append(row(dwidth(f"  {emsg}"), f"  {fg(C_AMBER)}{emsg}{RESET}"))
     elif not rows:
-        lines.append(f"{dim}no sessions{reset}")
+        m = "  no sessions yet"
+        lines.append(row(dwidth(m), f"  {faint}no sessions yet{RESET}"))
     else:
-        for status, title, ts in rows[:14]:
+        head_v = "  STATUS      WHEN       TASK"
+        head_a = f"  {faint}STATUS      WHEN       TASK{RESET}"
+        lines.append(row(dwidth(head_v), head_a))
+        for status, title, last_act, updated in rows[:12]:
             name = str(status).lower()
             if name == "working" and live:
-                icon, color, label = "●", green, "working"
+                icon, ic, badge = "▶", fg(C_GREEN), "running"
             elif name == "working":
-                # The database says working but no engine is heartbeating:
-                # the turn already finished, the status is just stale.
-                icon, color, label = "◌", dim, "stale"
+                icon, ic, badge = "◌", faint, "stale"
             elif name in ("error", "failed"):
-                icon, color, label = "✕", red, name
+                icon, ic, badge = "✕", fg(C_RED), "failed"
+            elif name == "completed":
+                icon, ic, badge = "✓", mute, "done"
             else:
-                icon, color, label = "○", dim, name
-            text = str(title or "(untitled)").replace("\n", " ")[:56]
-            lines.append(f"{color}{icon}{reset} {label:<10} {fmt_ts(ts)}  {text}")
-    sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(lines) + "\n")
+                icon, ic, badge = "◇", faint, name[:7]
+            when = fmt_age(last_act)
+            # Prefix is all single-width; the title may contain CJK so it is
+            # truncated by display width and padding is measured the same way.
+            prefix_v = f"  {icon} {badge:<8}  {when:<9}  "
+            task = dtrunc(str(title or "(untitled)").replace("\n", " "),
+                          (WIDTH - 2) - dwidth(prefix_v))
+            line_v = prefix_v + task
+            line_a = (
+                f"  {ic}{icon}{RESET} {ic}{badge:<8}{RESET}  "
+                f"{faint}{when:<9}{RESET}  {text}{task}{RESET}"
+            )
+            lines.append(row(dwidth(line_v), line_a))
+
+    lines.append(row(0, ""))
+    total = len(rows)
+    running = sum(1 for r in rows if str(r[0]).lower() == "working") if rows else 0
+    foot_v = f"  {total} sessions · {running} working · poll {POLL_HINT}s"
+    foot_a = (
+        f"  {faint}{total} sessions · {running} working · "
+        f"poll {POLL_HINT}s{RESET}"
+    )
+    lines.append(f"{accent}├{'─' * (WIDTH - 2)}┤{RESET}")
+    lines.append(row(dwidth(foot_v), foot_a))
+    lines.append(bot)
+
+    sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H" + "\n".join(lines) + "\n")
     sys.stdout.flush()
 
+
+POLL_HINT = os.environ.get("HERDR_WORKBUDDY_POLL_INTERVAL", "3")
+
+
+# ===========================================================================
+# Poll + state machine
+# ===========================================================================
 error, rows = load_sessions()
 live = engine_live()
 state, message = aggregate(rows, error, live)
 render_dashboard(state, rows, error, live)
 
-# Transition dwell: WorkBuddy's status field is authoritative while a task
-# runs, but around turn completion a background writer (title/summary/usage
-# sync) can flip it working->completed->working within seconds. Reporting
-# every flip makes herdr play spurious done/request sounds. Require the
-# candidate state to survive two consecutive polls before reporting it.
 candidate = f"{state}:{message or ''}"
 try:
     with open(state_file, encoding="utf-8") as handle:
@@ -196,32 +398,10 @@ except Exception:
     persisted = {}
 
 reported = persisted.get("reported")
-if candidate == reported:
-    pass
-elif candidate == persisted.get("candidate"):
-    if persisted.get("candidate_count", 1) >= 1:
-        params = {
-            "pane_id": pane_id,
-            "source": source,
-            "agent": agent,
-            "state": state,
-            "seq": time.time_ns(),
-        }
-        if message:
-            params["message"] = message
-        send("pane.report_agent", params)
-        persisted["reported"] = candidate
-        persisted.pop("candidate", None)
-        persisted.pop("candidate_count", None)
-    else:
-        persisted["candidate_count"] = persisted.get("candidate_count", 0) + 1
-else:
-    persisted["candidate"] = candidate
-    persisted["candidate_count"] = 1
+reported_state = str(reported).split(":", 1)[0] if reported else None
 
-if persisted.get("reported") is None:
-    # First ever observation: report immediately so the pane gets state
-    # without waiting out the dwell window.
+
+def emit():
     params = {
         "pane_id": pane_id,
         "source": source,
@@ -235,6 +415,36 @@ if persisted.get("reported") is None:
     persisted["reported"] = candidate
     persisted.pop("candidate", None)
     persisted.pop("candidate_count", None)
+
+
+if reported is None:
+    # First ever observation: report immediately so the pane gets state
+    # without waiting out the dwell window.
+    emit()
+elif candidate == reported:
+    # Nothing changed; clear any stale in-flight candidate.
+    persisted.pop("candidate", None)
+    persisted.pop("candidate_count", None)
+else:
+    # Hysteresis: how many consecutive confirmations does THIS transition
+    # need? Entering working is quick so long builds show up fast. Leaving
+    # working is slow so a background writer that momentarily flips the row to
+    # completed and back cannot fire a false completion sound.
+    if state == "working":
+        needed = ENTER_WORKING_POLLS
+    elif reported_state == "working":
+        needed = LEAVE_WORKING_POLLS
+    else:
+        needed = GENERIC_POLLS
+
+    if candidate == persisted.get("candidate"):
+        count = persisted.get("candidate_count", 1) + 1
+    else:
+        count = 1
+    persisted["candidate"] = candidate
+    persisted["candidate_count"] = count
+    if count >= needed:
+        emit()
 
 try:
     with open(state_file, "w", encoding="utf-8") as handle:

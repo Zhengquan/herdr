@@ -1709,7 +1709,7 @@ fn install_workbuddy_writes_watcher_without_autospawn() {
     let content = fs::read_to_string(&installed.watch_path).unwrap();
     assert_eq!(content, WORKBUDDY_WATCH_ASSET);
     assert!(content.contains("HERDR_INTEGRATION_ID=workbuddy"));
-    assert!(content.contains("HERDR_INTEGRATION_VERSION=3"));
+    assert!(content.contains("HERDR_INTEGRATION_VERSION=4"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1775,6 +1775,9 @@ fn install_workbuddy_is_idempotent_without_server() {
     let workbuddy_dir = base.join(".workbuddy");
     fs::create_dir_all(&workbuddy_dir).unwrap();
     std::env::set_var(WORKBUDDY_HOME_ENV_VAR, &workbuddy_dir);
+    // Disable the bridge-pane auto-spawn so the test is hermetic even on a
+    // machine that happens to be running a live herdr server.
+    std::env::set_var(WORKBUDDY_NO_AUTOSPAWN_ENV_VAR, "1");
     // No server is running, so spawn_workbuddy_bridge returns None and only
     // the watcher script is installed. A second install must not fail and
     // must not leave the script in a half-written state.
