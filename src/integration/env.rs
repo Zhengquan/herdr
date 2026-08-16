@@ -24,6 +24,7 @@ pub(crate) const GROK_CONFIG_DIR_ENV_VAR: &str = "GROK_CONFIG_DIR";
 /// `$GROK_HOME/config.toml` and `$GROK_HOME/auth.json`).
 pub(crate) const GROK_HOME_ENV_VAR: &str = "GROK_HOME";
 pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
+pub(crate) const CODEBUDDY_HOME_ENV_VAR: &str = "CODEBUDDY_HOME";
 
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
@@ -164,6 +165,10 @@ pub(crate) fn qwen_dir() -> io::Result<PathBuf> {
 
 pub(crate) fn cursor_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(CURSOR_CONFIG_DIR_ENV_VAR, &[".cursor"])
+}
+
+pub(crate) fn codebuddy_dir() -> io::Result<PathBuf> {
+    config_dir_from_env_or_home(CODEBUDDY_HOME_ENV_VAR, &[".codebuddy"])
 }
 
 pub(crate) fn mastracode_dir() -> io::Result<PathBuf> {
