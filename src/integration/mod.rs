@@ -258,7 +258,7 @@ const CODEBUDDY_REMOVED_LIFECYCLE_HOOK_EVENTS: [(&str, &str); 4] = [
 /// state over the socket API from inside a Herdr pane.
 const WORKBUDDY_WATCH_INSTALL_NAME: &str = "herdr-workbuddy-watch.sh";
 const WORKBUDDY_WATCH_ASSET: &str = include_str!("assets/workbuddy/herdr-workbuddy-watch.sh");
-const WORKBUDDY_INTEGRATION_VERSION: u32 = 4;
+const WORKBUDDY_INTEGRATION_VERSION: u32 = 5;
 /// Skip the bridge-pane auto-spawn (test seam; also honored for users who
 /// only want the watcher script installed).
 const WORKBUDDY_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_WORKBUDDY_NO_AUTOSPAWN";

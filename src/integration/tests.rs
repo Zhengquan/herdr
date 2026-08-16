@@ -1709,7 +1709,7 @@ fn install_workbuddy_writes_watcher_without_autospawn() {
     let content = fs::read_to_string(&installed.watch_path).unwrap();
     assert_eq!(content, WORKBUDDY_WATCH_ASSET);
     assert!(content.contains("HERDR_INTEGRATION_ID=workbuddy"));
-    assert!(content.contains("HERDR_INTEGRATION_VERSION=4"));
+    assert!(content.contains("HERDR_INTEGRATION_VERSION=5"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add customizations beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=workbuddy
-# HERDR_INTEGRATION_VERSION=4
+# HERDR_INTEGRATION_VERSION=5
 #
 # WorkBuddy is a standalone macOS desktop app: it never runs inside a Herdr
 # pane, so process detection and screen manifests cannot observe it. This
@@ -35,6 +35,7 @@ import socket
 import sqlite3
 import sys
 import time
+import unicodedata
 
 source = "herdr:workbuddy"
 agent = "workbuddy"
@@ -48,15 +49,26 @@ NOW = time.time()
 NOW_MS = NOW * 1000
 
 # ---------------------------------------------------------------------------
-# Tunables. All time windows are chosen to be longer than WorkBuddy's ~1s
-# engine heartbeat cadence and its ~3-10s background-writer cadence, so that
-# routine bookkeeping never registers as task execution.
+# Signal model (validated against live WorkBuddy data)
 # ---------------------------------------------------------------------------
-ENGINE_LIVE_S = 12          # a non-prewarm engine heartbeat this fresh = a host is alive
-WORKING_UPDATED_S = 15      # a working row whose updated_at is this fresh = actively executing
+# * A session that is genuinely executing cycles its DB `status` between
+#   'working' and 'planning' (and occasionally other active verbs) while its
+#   `updated_at` keeps advancing every few seconds. This is the RELIABLE
+#   "task is running" signal.
+# * The interactive engine heartbeat file (<pid>.json mtime) is NOT reliable
+#   for this: it drifts up to ~30s stale during genuine execution before
+#   jumping fresh again. Gating on a tight heartbeat window therefore made a
+#   running task oscillate to idle and fire phantom completion sounds.
+# * The only thing the heartbeat is used for now is rejecting a pure-phantom
+#   case: a prewarm pool worker (kind=prewarm / meta.status=idle) must never
+#   be mistaken for a live host. A genuine active DB row is trusted on its own.
+# ---------------------------------------------------------------------------
+ACTIVE_STATUSES = ("working", "planning", "running", "executing", "in_progress")
+ACTIVE_UPDATED_S = 45       # an active row whose updated_at is this fresh = executing
+ENGINE_LIVE_S = 60          # loose host-alive window (heartbeat drifts a lot)
 FAILED_RECENT_MS = 30 * 60_000
 ENTER_WORKING_POLLS = 1     # confirmations required to ENTER working (report quickly)
-LEAVE_WORKING_POLLS = 3     # confirmations required to LEAVE working (absorb writer blips)
+LEAVE_WORKING_POLLS = 4     # confirmations required to LEAVE working (absorb blips)
 GENERIC_POLLS = 2           # confirmations for any other transition
 
 
@@ -96,19 +108,9 @@ def load_sessions():
 
 
 def engine_live():
-    """True while a *task-executing* WorkBuddy engine is heartbeating.
-
-    Each session spawns a host-cli engine that rewrites its <pid>.json
-    heartbeat about once a second. Two kinds of engine must NOT count as a
-    running task, or the bridge fires phantom completion sounds:
-
-      * prewarm pool workers (kind == "prewarm"): idle engines kept warm for
-        fast session startup. They refresh on a timer while executing nothing.
-      * any descriptor whose meta.status is "idle".
-
-    Only a fresh heartbeat from a non-prewarm, non-idle engine is treated as a
-    live host. Host liveness alone is still not "a task is running" — that is
-    decided in aggregate() together with the database — but it gates it.
+    """True while at least one real (non-prewarm, non-idle) WorkBuddy host is
+    present. Used only as a weak phantom guard, with a loose window because the
+    interactive heartbeat mtime drifts substantially during execution.
     """
     sessions_dir = os.path.join(workbuddy_home, "sessions")
     try:
@@ -128,8 +130,6 @@ def engine_live():
             with open(path, encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception:
-            # Fresh but unreadable: be conservative and ignore it rather than
-            # letting an unknown descriptor pin the state to working.
             continue
         if str(data.get("kind", "")).lower() == "prewarm":
             continue
@@ -140,38 +140,40 @@ def engine_live():
     return False
 
 
+def age_ms(value):
+    try:
+        return NOW_MS - int(value)
+    except Exception:
+        return float("inf")
+
+
+def is_active_status(status):
+    return str(status).lower() in ACTIVE_STATUSES
+
+
 def aggregate(rows, error, live):
     """Return (state, message).
 
-    Working requires BOTH signals to agree:
-      * the database has a session whose status == 'working' with a fresh
-        updated_at (an engine is actively writing to it), AND
-      * a non-prewarm engine is heartbeating (engine_live()).
-
-    Requiring both eliminates the two historical failure modes: a stuck
-    'working' status with no live engine (no phantom working), and a live but
-    idle prewarm engine with no working row (no phantom sound).
+    A task is 'working' when the database has an active session (status in
+    ACTIVE_STATUSES: working/planning/...) whose updated_at is fresh. That row
+    alone is authoritative: a genuinely running task keeps advancing
+    updated_at every few seconds regardless of the drifting engine heartbeat.
+    The heartbeat only helps reject the pure-phantom case where a prewarm
+    worker is the only thing alive and there is no active row at all.
     """
     if error:
         return ("idle", error)
 
-    def age_ms(value):
-        try:
-            return NOW_MS - int(value)
-        except Exception:
-            return float("inf")
-
-    working_row = next(
+    active_row = next(
         (
             r
             for r in rows
-            if str(r[0]).lower() == "working"
-            and age_ms(r[3]) < WORKING_UPDATED_S * 1000
+            if is_active_status(r[0]) and age_ms(r[3]) < ACTIVE_UPDATED_S * 1000
         ),
         None,
     )
-    if live and working_row is not None:
-        title = str(working_row[1] or "task")
+    if active_row is not None:
+        title = str(active_row[1] or "task")
         return ("working", title[:120])
 
     failed = [
@@ -208,6 +210,7 @@ def bg(code):
 C_ACCENT = 39     # cyan-blue brand accent
 C_ACCENT2 = 45    # lighter cyan
 C_GREEN = 42
+C_BLUE = 75
 C_RED = 203
 C_AMBER = 214
 C_MUTE = 244
@@ -220,12 +223,19 @@ STATE_THEME = {
     "idle": (C_MUTE, "IDLE", "◇"),
 }
 
-
-def fmt_ts(ms):
-    try:
-        return time.strftime("%H:%M", time.localtime(int(ms) / 1000))
-    except Exception:
-        return "--:--"
+# Per-session-row presentation for each raw DB status. Keys are lowercased
+# status strings; the badge text is what shows in the STATUS column.
+ROW_ICONS = {
+    "working": ("▶", C_GREEN, "running"),
+    "running": ("▶", C_GREEN, "running"),
+    "executing": ("▶", C_GREEN, "running"),
+    "in_progress": ("▶", C_GREEN, "running"),
+    "planning": ("◐", C_BLUE, "planning"),
+    "error": ("✕", C_RED, "failed"),
+    "failed": ("✕", C_RED, "failed"),
+    "terminated": ("⊘", C_MUTE, "stopped"),
+    "completed": ("✓", C_MUTE, "done"),
+}
 
 
 def fmt_age(ms):
@@ -234,17 +244,14 @@ def fmt_age(ms):
     except Exception:
         return ""
     if secs < 60:
-        return f"{secs}s ago"
+        return f"{secs}s"
     mins = secs // 60
     if mins < 60:
-        return f"{mins}m ago"
+        return f"{mins}m"
     hours = mins // 60
     if hours < 24:
-        return f"{hours}h ago"
-    return f"{hours // 24}d ago"
-
-
-import unicodedata
+        return f"{hours}h"
+    return f"{hours // 24}d"
 
 
 def dwidth(text):
@@ -275,15 +282,17 @@ def dtrunc(text, limit):
     return "".join(out) + "…"
 
 
-WIDTH = 72
+def dpad(text, width):
+    """Right-pad `text` to `width` display columns (CJK-aware)."""
+    pad = width - dwidth(text)
+    return text + (" " * pad if pad > 0 else "")
 
 
-def rule(left, right=""):
-    inner = WIDTH - 2
-    pad = inner - len(left) - len(right)
-    if pad < 1:
-        pad = 1
-    return f"{left}{' ' * pad}{right}"
+# Layout. WIDTH is generous so long CJK task titles are fully visible; the
+# STATUS column is wide enough for the longest badge ("planning").
+WIDTH = 94
+COL_STATUS = 11   # icon + widest badge ("planning") + breathing room
+COL_WHEN = 7      # relative age like "12m", "3h"
 
 
 def render_dashboard(state, rows, error, live):
@@ -293,25 +302,27 @@ def render_dashboard(state, rows, error, live):
     text = fg(C_TEXT)
     mute = fg(C_MUTE)
     faint = fg(C_FAINT)
+    inner = WIDTH - 2
 
-    top = f"{accent}╭{'─' * (WIDTH - 2)}╮{RESET}"
-    bot = f"{accent}╰{'─' * (WIDTH - 2)}╯{RESET}"
+    top = f"{accent}╭{'─' * inner}╮{RESET}"
+    bot = f"{accent}╰{'─' * inner}╯{RESET}"
+    sep = f"{accent}├{'─' * inner}┤{RESET}"
 
     def row(content_visible, content_ansi):
-        pad = (WIDTH - 2) - content_visible
+        pad = inner - content_visible
         if pad < 0:
             pad = 0
         return f"{accent}│{RESET}{content_ansi}{' ' * pad}{accent}│{RESET}"
 
     # Header line: brand + engine dot + clock.
     dot = f"{fg(C_GREEN)}●{RESET}" if live else f"{faint}○{RESET}"
-    engine_txt = "engine live" if live else "engine idle"
+    engine_txt = "host live" if live else "host idle"
     clock = time.strftime("%H:%M:%S")
-    left_v = f"  WorkBuddy  bridge"
+    left_v = "  WorkBuddy  bridge"
     left_a = f"  {BOLD}{a2}WorkBuddy{RESET}{mute}  bridge{RESET}"
     right_v = f"{engine_txt}  {clock}  "
     right_a = f"{dot} {mute}{engine_txt}{RESET}  {faint}{clock}{RESET}  "
-    mid_pad = (WIDTH - 2) - dwidth(left_v) - dwidth(right_v)
+    mid_pad = inner - dwidth(left_v) - dwidth(right_v)
     if mid_pad < 1:
         mid_pad = 1
     header_a = left_a + (" " * mid_pad) + right_a
@@ -323,55 +334,65 @@ def render_dashboard(state, rows, error, live):
     lines = [
         top,
         row(dwidth(header_v), header_a),
-        f"{accent}├{'─' * (WIDTH - 2)}┤{RESET}",
+        sep,
         row(dwidth(badge_v), badge_a),
         row(0, ""),
     ]
 
     if error:
-        emsg = dtrunc(str(error), WIDTH - 6)
+        emsg = dtrunc(str(error), inner - 4)
         lines.append(row(dwidth(f"  {emsg}"), f"  {fg(C_AMBER)}{emsg}{RESET}"))
     elif not rows:
         m = "  no sessions yet"
         lines.append(row(dwidth(m), f"  {faint}no sessions yet{RESET}"))
     else:
-        head_v = "  STATUS      WHEN       TASK"
-        head_a = f"  {faint}STATUS      WHEN       TASK{RESET}"
+        # Column header.
+        h_status = dpad("STATUS", COL_STATUS)
+        h_when = dpad("WHEN", COL_WHEN)
+        head_v = f"  {h_status}  {h_when}  TASK"
+        head_a = f"  {faint}{h_status}  {h_when}  TASK{RESET}"
         lines.append(row(dwidth(head_v), head_a))
+
+        # TASK column gets whatever is left after the fixed prefix.
+        prefix_cols = 2 + COL_STATUS + 2 + COL_WHEN + 2
+        task_budget = inner - prefix_cols
         for status, title, last_act, updated in rows[:12]:
             name = str(status).lower()
-            if name == "working" and live:
-                icon, ic, badge = "▶", fg(C_GREEN), "running"
-            elif name == "working":
-                icon, ic, badge = "◌", faint, "stale"
-            elif name in ("error", "failed"):
-                icon, ic, badge = "✕", fg(C_RED), "failed"
-            elif name == "completed":
-                icon, ic, badge = "✓", mute, "done"
-            else:
-                icon, ic, badge = "◇", faint, name[:7]
+            icon, icolor, badge = ROW_ICONS.get(name, ("◇", C_FAINT, name[:COL_STATUS - 2]))
+            fresh = is_active_status(name) and age_ms(updated) < ACTIVE_UPDATED_S * 1000
+            if name in ("working", "running", "executing", "in_progress", "planning") and not fresh:
+                # Active verb but the row went stale: it is not really running.
+                icon, icolor, badge = "◌", C_FAINT, "idle"
+            ic = fg(icolor)
+
+            status_field = f"{icon} {badge}"
+            status_v = dpad(status_field, COL_STATUS)
+            # Build the colored variant, then pad from the *visible* width so
+            # the escape bytes do not throw the column alignment off.
+            status_pad = COL_STATUS - dwidth(status_field)
+            status_a = f"{ic}{icon}{RESET} {ic}{badge}{RESET}" + (
+                " " * (status_pad if status_pad > 0 else 0)
+            )
+
             when = fmt_age(last_act)
-            # Prefix is all single-width; the title may contain CJK so it is
-            # truncated by display width and padding is measured the same way.
-            prefix_v = f"  {icon} {badge:<8}  {when:<9}  "
-            task = dtrunc(str(title or "(untitled)").replace("\n", " "),
-                          (WIDTH - 2) - dwidth(prefix_v))
-            line_v = prefix_v + task
+            when_v = dpad(when, COL_WHEN)
+
+            task = dtrunc(str(title or "(untitled)").replace("\n", " "), task_budget)
+            line_v = f"  {status_v}  {when_v}  {task}"
             line_a = (
-                f"  {ic}{icon}{RESET} {ic}{badge:<8}{RESET}  "
-                f"{faint}{when:<9}{RESET}  {text}{task}{RESET}"
+                f"  {status_a}  {faint}{when_v}{RESET}  {text}{task}{RESET}"
             )
             lines.append(row(dwidth(line_v), line_a))
 
     lines.append(row(0, ""))
     total = len(rows)
-    running = sum(1 for r in rows if str(r[0]).lower() == "working") if rows else 0
-    foot_v = f"  {total} sessions · {running} working · poll {POLL_HINT}s"
+    running = sum(1 for r in rows if is_active_status(r[0])) if rows else 0
+    foot_v = f"  {total} sessions · {running} active · poll {POLL_HINT}s"
     foot_a = (
-        f"  {faint}{total} sessions · {running} working · "
+        f"  {faint}{total} sessions · {running} active · "
         f"poll {POLL_HINT}s{RESET}"
     )
-    lines.append(f"{accent}├{'─' * (WIDTH - 2)}┤{RESET}")
+    lines.append(sep)
     lines.append(row(dwidth(foot_v), foot_a))
     lines.append(bot)
 
