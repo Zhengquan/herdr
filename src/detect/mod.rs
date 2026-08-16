@@ -64,10 +64,11 @@ pub enum Agent {
     Qwen,
     Maki,
     Codebuddy,
+    Workbuddy,
 }
 
 impl Agent {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -91,6 +92,7 @@ impl Agent {
         Self::Qwen,
         Self::Maki,
         Self::Codebuddy,
+        Self::Workbuddy,
     ];
 
     pub const SCREEN_MANIFEST_AGENTS: [Self; 21] = [
@@ -143,6 +145,7 @@ pub fn agent_label(agent: Agent) -> &'static str {
         Agent::Qwen => "qwen",
         Agent::Maki => "maki",
         Agent::Codebuddy => "codebuddy",
+        Agent::Workbuddy => "workbuddy",
     }
 }
 
@@ -177,6 +180,9 @@ pub fn interactive_agent_executable(agent: Agent) -> &'static str {
         Agent::Qwen => "qwen",
         Agent::Maki => "maki",
         Agent::Codebuddy => "codebuddy",
+        // WorkBuddy is a standalone desktop app with no terminal executable;
+        // this label exists so the bridge integration can own the agent name.
+        Agent::Workbuddy => "workbuddy",
     }
 }
 
@@ -215,6 +221,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
         "qwen" | "qwen-code" | "qwen code" => Some(Agent::Qwen),
         "maki" => Some(Agent::Maki),
         "codebuddy" => Some(Agent::Codebuddy),
+        "workbuddy" => Some(Agent::Workbuddy),
         _ => None,
     }
 }
@@ -741,6 +748,7 @@ mod tests {
         assert_eq!(identify_agent("Qwen Code"), Some(Agent::Qwen));
         assert_eq!(identify_agent("maki"), Some(Agent::Maki));
         assert_eq!(identify_agent("codebuddy"), Some(Agent::Codebuddy));
+        assert_eq!(identify_agent("workbuddy"), Some(Agent::Workbuddy));
     }
 
     #[test]
@@ -769,6 +777,7 @@ mod tests {
         assert_eq!(parse_agent_label("maki"), Some(Agent::Maki));
         assert_eq!(parse_agent_label("kilo-code"), Some(Agent::Kilo));
         assert_eq!(parse_agent_label("codebuddy"), Some(Agent::Codebuddy));
+        assert_eq!(parse_agent_label("workbuddy"), Some(Agent::Workbuddy));
     }
 
     #[test]
@@ -813,6 +822,7 @@ mod tests {
             (Agent::Qwen, "qwen"),
             (Agent::Maki, "maki"),
             (Agent::Codebuddy, "codebuddy"),
+            (Agent::Workbuddy, "workbuddy"),
         ];
         assert_eq!(expected.len(), Agent::ALL.len());
         for (agent, executable) in expected {

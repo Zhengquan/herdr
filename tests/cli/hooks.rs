@@ -280,6 +280,25 @@ fn codebuddy_hook_ignores_unknown_actions() {
 }
 
 #[test]
+fn workbuddy_watch_reports_idle_when_database_missing() {
+    let request = run_shell_hook_with_env(
+        "src/integration/assets/workbuddy/herdr-workbuddy-watch.sh",
+        &[],
+        "",
+        &[
+            ("HERDR_WORKBUDDY_WATCH_ONCE", "1"),
+            ("WORKBUDDY_HOME", "/nonexistent-workbuddy-home"),
+        ],
+    )
+    .expect("workbuddy watcher should report idle when the database is missing");
+
+    assert_eq!(request["method"], "pane.report_agent");
+    assert_eq!(request["params"]["agent"], "workbuddy");
+    assert_eq!(request["params"]["state"], "idle");
+    assert_eq!(request["params"]["message"], "WorkBuddy database not found");
+}
+
+#[test]
 fn copilot_hook_reports_session_id_from_stdin() {
     let request = run_copilot_hook(
         r#"{"hook_event_name":"SessionStart","session_id":"copilot-session","source":"resume"}"#,

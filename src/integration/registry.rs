@@ -26,6 +26,7 @@ pub(crate) fn integration_target_label(
         crate::api::schema::IntegrationTarget::AntigravityCli => "antigravity-cli",
         crate::api::schema::IntegrationTarget::Grok => "grok",
         crate::api::schema::IntegrationTarget::Codebuddy => "codebuddy",
+        crate::api::schema::IntegrationTarget::Workbuddy => "workbuddy",
     }
 }
 
@@ -57,6 +58,9 @@ pub(crate) fn integration_target_command_names(
         crate::api::schema::IntegrationTarget::AntigravityCli => &["agy"],
         crate::api::schema::IntegrationTarget::Grok => &["grok"],
         crate::api::schema::IntegrationTarget::Codebuddy => &["codebuddy"],
+        // WorkBuddy is a desktop app without a PATH command; availability is
+        // detected via its data directory in install_layout_available.
+        crate::api::schema::IntegrationTarget::Workbuddy => &["workbuddy"],
     }
 }
 
@@ -124,6 +128,11 @@ pub(crate) fn integration_target_install_layout_available(
     match target {
         crate::api::schema::IntegrationTarget::Codex => codex_standalone_binary_available(),
         crate::api::schema::IntegrationTarget::Hermes => hermes_install_layout_available(),
+        // WorkBuddy has no CLI on PATH; the app data directory existing is the
+        // install signal.
+        crate::api::schema::IntegrationTarget::Workbuddy => {
+            workbuddy_dir().is_ok_and(|dir| dir.is_dir())
+        }
         _ => false,
     }
 }
@@ -270,7 +279,7 @@ fn integration_specs() -> [(
     crate::api::schema::IntegrationTarget,
     io::Result<PathBuf>,
     u32,
-); 18] {
+); 19] {
     [
         (
             crate::api::schema::IntegrationTarget::Pi,
@@ -367,6 +376,11 @@ fn integration_specs() -> [(
             crate::api::schema::IntegrationTarget::Codebuddy,
             codebuddy_dir().map(|dir| dir.join("hooks").join(super::CODEBUDDY_HOOK_INSTALL_NAME)),
             super::CODEBUDDY_INTEGRATION_VERSION,
+        ),
+        (
+            crate::api::schema::IntegrationTarget::Workbuddy,
+            workbuddy_dir().map(|dir| dir.join("herdr").join(super::WORKBUDDY_WATCH_INSTALL_NAME)),
+            super::WORKBUDDY_INTEGRATION_VERSION,
         ),
     ]
 }

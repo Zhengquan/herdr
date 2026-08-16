@@ -289,3 +289,17 @@ pub(crate) struct CodebuddyUninstallResult {
     pub removed_hook_file: bool,
     pub updated_settings: bool,
 }
+
+#[derive(Debug)]
+pub(crate) struct WorkbuddyInstallPaths {
+    pub watch_path: PathBuf,
+    /// Pane id of the auto-spawned bridge pane, when a Herdr server was
+    /// reachable at install time.
+    pub bridge_pane: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorkbuddyUninstallResult {
+    pub watch_path: PathBuf,
+    pub removed_watch_file: bool,
+}

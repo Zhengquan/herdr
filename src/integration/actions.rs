@@ -5,10 +5,11 @@ use super::targets::{
     install_antigravity_cli, install_claude, install_codebuddy, install_codex, install_copilot,
     install_cursor, install_devin, install_droid, install_grok, install_hermes, install_kilo,
     install_kimi, install_mastracode, install_omp, install_opencode, install_pi, install_qodercli,
-    install_qwen, uninstall_antigravity_cli, uninstall_claude, uninstall_codebuddy,
-    uninstall_codex, uninstall_copilot, uninstall_cursor, uninstall_devin, uninstall_droid,
-    uninstall_grok, uninstall_hermes, uninstall_kilo, uninstall_kimi, uninstall_mastracode,
-    uninstall_omp, uninstall_opencode, uninstall_pi, uninstall_qodercli, uninstall_qwen,
+    install_qwen, install_workbuddy, uninstall_antigravity_cli, uninstall_claude,
+    uninstall_codebuddy, uninstall_codex, uninstall_copilot, uninstall_cursor, uninstall_devin,
+    uninstall_droid, uninstall_grok, uninstall_hermes, uninstall_kilo, uninstall_kimi,
+    uninstall_mastracode, uninstall_omp, uninstall_opencode, uninstall_pi, uninstall_qodercli,
+    uninstall_qwen, uninstall_workbuddy,
 };
 use super::version::{agent_version_requirement, enforce_agent_version};
 use super::{KIMI_MIN_VERSION, PI_EXTENSION_INSTALL_NAME};
@@ -266,6 +267,23 @@ fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Re
                     installed.settings_path.display()
                 ),
             ]
+        }
+        crate::api::schema::IntegrationTarget::Workbuddy => {
+            let installed = install_workbuddy()?;
+            let mut messages = vec![format!(
+                "installed workbuddy bridge watcher to {}",
+                installed.watch_path.display()
+            )];
+            match installed.bridge_pane {
+                Some(pane_id) => messages.push(format!(
+                    "started workbuddy bridge in pane {pane_id} of the new \"WorkBuddy\" workspace"
+                )),
+                None => messages.push(format!(
+                    "no running herdr server found; start the bridge later by running `sh {}` inside any herdr pane",
+                    installed.watch_path.display()
+                )),
+            }
+            messages
         }
     };
 
@@ -746,6 +764,20 @@ pub(crate) fn uninstall_target(
                 ));
             }
             messages
+        }
+        crate::api::schema::IntegrationTarget::Workbuddy => {
+            let result = uninstall_workbuddy()?;
+            if result.removed_watch_file {
+                vec![format!(
+                    "removed workbuddy bridge watcher at {}; any running bridge exits on its next poll",
+                    result.watch_path.display()
+                )]
+            } else {
+                vec![format!(
+                    "no workbuddy bridge watcher found at {}",
+                    result.watch_path.display()
+                )]
+            }
         }
     };
 

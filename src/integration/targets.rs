@@ -20,7 +20,7 @@ use super::config_edit::{
 use super::env::{
     antigravity_cli_dir, claude_dir, codebuddy_dir, codex_dir, copilot_dir, cursor_dir, devin_dir,
     droid_dir, grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir,
-    omp_extension_dir, opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir,
+    omp_extension_dir, opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir, workbuddy_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
@@ -38,6 +38,7 @@ use super::types::{
     KimiUninstallResult, MastracodeInstallPaths, MastracodeUninstallResult, OmpInstallPaths,
     OmpUninstallResult, OpenCodeInstallPaths, OpenCodeUninstallResult, PiUninstallResult,
     QodercliInstallPaths, QodercliUninstallResult, QwenInstallPaths, QwenUninstallResult,
+    WorkbuddyInstallPaths, WorkbuddyUninstallResult,
 };
 use super::{
     ANTIGRAVITY_CLI_HOOK_ASSET, ANTIGRAVITY_CLI_HOOK_BLOCK_NAME, ANTIGRAVITY_CLI_HOOK_EVENTS,
@@ -58,7 +59,8 @@ use super::{
     OPENCODE_PLUGIN_INSTALL_NAME, OPENCODE_TUI_PLUGIN_ASSET, OPENCODE_TUI_PLUGIN_INSTALL_NAME,
     OPENCODE_TUI_PLUGIN_SPEC, PI_EXTENSION_ASSET, PI_EXTENSION_INSTALL_NAME, QODERCLI_HOOK_ASSET,
     QODERCLI_HOOK_EVENTS, QODERCLI_HOOK_INSTALL_NAME, QODERCLI_REMOVED_LIFECYCLE_HOOK_EVENTS,
-    QWEN_HOOK_ASSET, QWEN_HOOK_EVENTS, QWEN_HOOK_INSTALL_NAME,
+    QWEN_HOOK_ASSET, QWEN_HOOK_EVENTS, QWEN_HOOK_INSTALL_NAME, WORKBUDDY_NO_AUTOSPAWN_ENV_VAR,
+    WORKBUDDY_WATCH_ASSET, WORKBUDDY_WATCH_INSTALL_NAME,
 };
 
 fn ensure_extension_dir(dir: &Path, agent: &str) -> io::Result<()> {
@@ -727,6 +729,173 @@ pub(crate) fn uninstall_codebuddy() -> io::Result<CodebuddyUninstallResult> {
         settings_path,
         removed_hook_file,
         updated_settings,
+    })
+}
+
+pub(crate) fn install_workbuddy() -> io::Result<WorkbuddyInstallPaths> {
+    let dir = workbuddy_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "workbuddy directory not found at {}. install WorkBuddy first",
+            dir.display()
+        )));
+    }
+
+    let integration_dir = dir.join("herdr");
+    fs::create_dir_all(&integration_dir)?;
+
+    let watch_path = integration_dir.join(WORKBUDDY_WATCH_INSTALL_NAME);
+    fs::write(&watch_path, WORKBUDDY_WATCH_ASSET)?;
+    make_executable(&watch_path)?;
+
+    // Idempotent: if a watcher script already exists on disk, a previous
+    // install ran. We still (re)spawn the bridge so a restarted server picks
+    // up a fresh watcher process — but we avoid creating a second "WorkBuddy"
+    // workspace when one already exists.
+    let bridge_pane = spawn_workbuddy_bridge(&watch_path);
+
+    Ok(WorkbuddyInstallPaths {
+        watch_path,
+        bridge_pane,
+    })
+}
+
+/// Best-effort bridge startup. Idempotent: looks for an existing workspace
+/// labeled "WorkBuddy" and reuses its root pane (re-injecting the watcher
+/// command so a restarted server gets a fresh watcher process); only creates
+/// a new workspace when none exists. Returns the bridge pane id when a
+/// running Herdr server accepted the spawn. Never fails the install.
+#[cfg(not(windows))]
+fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<String> {
+    use crate::api::schema::{
+        EmptyParams, Method, PaneListParams, PaneSendInputParams, Request, ResponseResult,
+        WorkspaceCreateParams,
+    };
+
+    if std::env::var_os(WORKBUDDY_NO_AUTOSPAWN_ENV_VAR).is_some() {
+        return None;
+    }
+
+    let client = crate::api::client::ApiClient::local();
+    let command = format!(
+        "sh {}",
+        shell_single_quote(&watch_path.display().to_string())
+    );
+
+    // Look for an existing "WorkBuddy" workspace first.
+    let list = client
+        .request(Request {
+            id: "integration:workbuddy:list".into(),
+            method: Method::WorkspaceList(EmptyParams::default()),
+        })
+        .ok()?;
+    let ResponseResult::WorkspaceList { workspaces } = list.result else {
+        return None;
+    };
+
+    let existing = workspaces
+        .into_iter()
+        .find(|workspace| workspace.label == "WorkBuddy");
+
+    let pane_id = if let Some(workspace) = existing {
+        // Reuse the existing workspace's root pane. List panes in that
+        // workspace and pick the first one.
+        let panes = client
+            .request(Request {
+                id: "integration:workbuddy:panes".into(),
+                method: Method::PaneList(PaneListParams {
+                    workspace_id: Some(workspace.workspace_id.clone()),
+                }),
+            })
+            .ok()?;
+        let ResponseResult::PaneList { panes } = panes.result else {
+            return None;
+        };
+        panes
+            .into_iter()
+            .next()
+            .map(|pane| pane.pane_id)
+            .or_else(|| {
+                // No panes in the workspace anymore; focus it so its root
+                // pane exists, then fall through to creating a fresh one.
+                let _ = client.request(Request {
+                    id: "integration:workbuddy:focus".into(),
+                    method: Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+                        workspace_id: workspace.workspace_id.clone(),
+                    }),
+                });
+                None
+            })
+            .or_else(|| {
+                // Re-list panes after focus; the root pane should exist now.
+                let panes = client
+                    .request(Request {
+                        id: "integration:workbuddy:panes:after-focus".into(),
+                        method: Method::PaneList(PaneListParams {
+                            workspace_id: Some(workspace.workspace_id.clone()),
+                        }),
+                    })
+                    .ok()?;
+                let ResponseResult::PaneList { panes } = panes.result else {
+                    return None;
+                };
+                panes.into_iter().next().map(|pane| pane.pane_id)
+            })
+    } else {
+        // No existing WorkBuddy workspace; create one.
+        let created = client
+            .request(Request {
+                id: "integration:workbuddy:workspace".into(),
+                method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                    cwd: None,
+                    focus: false,
+                    label: Some("WorkBuddy".into()),
+                    env: Default::default(),
+                }),
+            })
+            .ok()?;
+        let ResponseResult::WorkspaceCreated { root_pane, .. } = created.result else {
+            return None;
+        };
+        Some(root_pane.pane_id)
+    };
+
+    // If we still don't have a pane id, the workspace exists but has no pane.
+    // Re-creating the workspace via WorkspaceFocus above may have produced one
+    // on focus; bail out gracefully in that rare case.
+    let pane_id = pane_id?;
+
+    // (Re-)inject the watcher command into the pane so a freshly restarted
+    // server runs the latest watcher script.
+    client
+        .request(Request {
+            id: "integration:workbuddy:run".into(),
+            method: Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: command,
+                keys: vec!["Enter".into()],
+            }),
+        })
+        .ok()?;
+
+    Some(pane_id)
+}
+
+#[cfg(windows)]
+fn spawn_workbuddy_bridge(_watch_path: &Path) -> Option<String> {
+    None
+}
+
+pub(crate) fn uninstall_workbuddy() -> io::Result<WorkbuddyUninstallResult> {
+    let dir = workbuddy_dir()?;
+    let watch_path = dir.join("herdr").join(WORKBUDDY_WATCH_INSTALL_NAME);
+    // The running watcher notices the missing script on its next poll and
+    // exits on its own; the bridge pane remains as a plain shell.
+    let removed_watch_file = remove_file_if_exists(&watch_path)?;
+
+    Ok(WorkbuddyUninstallResult {
+        watch_path,
+        removed_watch_file,
     })
 }
 
