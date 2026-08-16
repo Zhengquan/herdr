@@ -780,8 +780,10 @@ fn spawn_workbuddy_bridge(watch_path: &Path) -> Option<(String, bool)> {
     }
 
     let client = crate::api::client::ApiClient::local();
+    // Kill any previously started watcher first so re-installs never stack
+    // multiple watcher processes in the same pane.
     let command = format!(
-        "sh {}",
+        "pkill -f 'herdr-workbuddy-watch\\.sh' 2>/dev/null; sh {}",
         shell_single_quote(&watch_path.display().to_string())
     );
 
