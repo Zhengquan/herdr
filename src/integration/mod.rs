@@ -262,6 +262,16 @@ const WORKBUDDY_INTEGRATION_VERSION: u32 = 6;
 /// Skip the bridge-pane auto-spawn (test seam; also honored for users who
 /// only want the watcher script installed).
 const WORKBUDDY_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_WORKBUDDY_NO_AUTOSPAWN";
+/// The Codex desktop app (Electron) never runs inside a Herdr pane, so — like
+/// WorkBuddy — the integration installs a bridge watcher that polls the app's
+/// local state (`~/.codex`) and reports state over the socket API. This is
+/// distinct from `Agent::Codex`, which detects the Codex CLI inside a pane.
+const CODEXAPP_WATCH_INSTALL_NAME: &str = "herdr-codexapp-watch.sh";
+const CODEXAPP_WATCH_ASSET: &str = include_str!("assets/codexapp/herdr-codexapp-watch.sh");
+const CODEXAPP_INTEGRATION_VERSION: u32 = 1;
+/// Skip the bridge-pane auto-spawn (test seam; also honored for users who
+/// only want the watcher script installed).
+const CODEXAPP_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_CODEXAPP_NO_AUTOSPAWN";
 #[cfg(windows)]
 const ANTIGRAVITY_CLI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.ps1";
 #[cfg(not(windows))]

@@ -178,6 +178,12 @@ pub(crate) fn workbuddy_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(WORKBUDDY_HOME_ENV_VAR, &[".workbuddy"])
 }
 
+/// The Codex desktop app shares its data directory (`~/.codex`) with the
+/// Codex CLI. Reuse `codex_dir()` so both integrations resolve the same path.
+pub(crate) fn codexapp_dir() -> io::Result<PathBuf> {
+    codex_dir()
+}
+
 pub(crate) fn mastracode_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".mastracode"))
 }

@@ -32,10 +32,11 @@ pub enum IntegrationTarget {
     Grok,
     Codebuddy,
     Workbuddy,
+    Codexapp,
 }
 
 impl IntegrationTarget {
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::Pi,
         Self::Omp,
         Self::Claude,
@@ -55,6 +56,7 @@ impl IntegrationTarget {
         Self::Grok,
         Self::Codebuddy,
         Self::Workbuddy,
+        Self::Codexapp,
     ];
 }
 

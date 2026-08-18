@@ -109,6 +109,7 @@ fn clear_integration_path_env() {
     std::env::remove_var(CODEBUDDY_HOME_ENV_VAR);
     std::env::remove_var(WORKBUDDY_HOME_ENV_VAR);
     std::env::remove_var(WORKBUDDY_NO_AUTOSPAWN_ENV_VAR);
+    std::env::remove_var(CODEXAPP_NO_AUTOSPAWN_ENV_VAR);
 }
 
 fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
@@ -1783,6 +1784,107 @@ fn install_workbuddy_is_idempotent_without_server() {
     // must not leave the script in a half-written state.
     let first = install_workbuddy().unwrap();
     let second = install_workbuddy().unwrap();
+    assert_eq!(first.watch_path, second.watch_path);
+    assert!(first.bridge_pane.is_none());
+    assert!(second.bridge_pane.is_none());
+    assert_eq!(
+        fs::read_to_string(&first.watch_path).unwrap(),
+        fs::read_to_string(&second.watch_path).unwrap(),
+    );
+
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codexapp_writes_watcher_without_autospawn() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let codex_dir = base.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    std::env::set_var(CODEX_HOME_ENV_VAR, &codex_dir);
+    std::env::set_var(CODEXAPP_NO_AUTOSPAWN_ENV_VAR, "1");
+
+    let installed = install_codexapp().unwrap();
+
+    assert_eq!(
+        installed.watch_path,
+        codex_dir.join("herdr").join(CODEXAPP_WATCH_INSTALL_NAME)
+    );
+    assert!(installed.bridge_pane.is_none());
+    let content = fs::read_to_string(&installed.watch_path).unwrap();
+    assert_eq!(content, CODEXAPP_WATCH_ASSET);
+    assert!(content.contains("HERDR_INTEGRATION_ID=codexapp"));
+    assert!(content.contains("HERDR_INTEGRATION_VERSION=1"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&installed.watch_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(mode & 0o111 != 0, "watcher must be executable");
+    }
+
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codexapp_errors_when_dir_missing() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let missing = base.join(".codex");
+    std::env::set_var(CODEX_HOME_ENV_VAR, &missing);
+    std::env::set_var(CODEXAPP_NO_AUTOSPAWN_ENV_VAR, "1");
+
+    let err = install_codexapp().unwrap_err().to_string();
+
+    assert!(
+        err.contains("codex directory not found"),
+        "unexpected error: {err}"
+    );
+
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn uninstall_codexapp_removes_watcher() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let codex_dir = base.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    std::env::set_var(CODEX_HOME_ENV_VAR, &codex_dir);
+    std::env::set_var(CODEXAPP_NO_AUTOSPAWN_ENV_VAR, "1");
+
+    let installed = install_codexapp().unwrap();
+    assert!(installed.watch_path.is_file());
+
+    let result = uninstall_codexapp().unwrap();
+
+    assert!(result.removed_watch_file);
+    assert!(!result.watch_path.exists());
+
+    // Uninstalling again is a no-op, not an error.
+    let second = uninstall_codexapp().unwrap();
+    assert!(!second.removed_watch_file);
+
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codexapp_is_idempotent_without_server() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let codex_dir = base.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    std::env::set_var(CODEX_HOME_ENV_VAR, &codex_dir);
+    std::env::set_var(CODEXAPP_NO_AUTOSPAWN_ENV_VAR, "1");
+
+    let first = install_codexapp().unwrap();
+    let second = install_codexapp().unwrap();
     assert_eq!(first.watch_path, second.watch_path);
     assert!(first.bridge_pane.is_none());
     assert!(second.bridge_pane.is_none());

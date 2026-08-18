@@ -27,6 +27,7 @@ pub(crate) fn integration_target_label(
         crate::api::schema::IntegrationTarget::Grok => "grok",
         crate::api::schema::IntegrationTarget::Codebuddy => "codebuddy",
         crate::api::schema::IntegrationTarget::Workbuddy => "workbuddy",
+        crate::api::schema::IntegrationTarget::Codexapp => "codexapp",
     }
 }
 
@@ -61,6 +62,9 @@ pub(crate) fn integration_target_command_names(
         // WorkBuddy is a desktop app without a PATH command; availability is
         // detected via its data directory in install_layout_available.
         crate::api::schema::IntegrationTarget::Workbuddy => &["workbuddy"],
+        // The Codex desktop app has no PATH command; availability is detected
+        // via its data directory in install_layout_available.
+        crate::api::schema::IntegrationTarget::Codexapp => &["codexapp"],
     }
 }
 
@@ -132,6 +136,11 @@ pub(crate) fn integration_target_install_layout_available(
         // install signal.
         crate::api::schema::IntegrationTarget::Workbuddy => {
             workbuddy_dir().is_ok_and(|dir| dir.is_dir())
+        }
+        // The Codex desktop app shares ~/.codex with the CLI; the data
+        // directory existing is the install signal.
+        crate::api::schema::IntegrationTarget::Codexapp => {
+            codexapp_dir().is_ok_and(|dir| dir.is_dir())
         }
         _ => false,
     }
@@ -279,7 +288,7 @@ fn integration_specs() -> [(
     crate::api::schema::IntegrationTarget,
     io::Result<PathBuf>,
     u32,
-); 19] {
+); 20] {
     [
         (
             crate::api::schema::IntegrationTarget::Pi,
@@ -381,6 +390,11 @@ fn integration_specs() -> [(
             crate::api::schema::IntegrationTarget::Workbuddy,
             workbuddy_dir().map(|dir| dir.join("herdr").join(super::WORKBUDDY_WATCH_INSTALL_NAME)),
             super::WORKBUDDY_INTEGRATION_VERSION,
+        ),
+        (
+            crate::api::schema::IntegrationTarget::Codexapp,
+            codexapp_dir().map(|dir| dir.join("herdr").join(super::CODEXAPP_WATCH_INSTALL_NAME)),
+            super::CODEXAPP_INTEGRATION_VERSION,
         ),
     ]
 }

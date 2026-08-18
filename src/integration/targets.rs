@@ -18,9 +18,10 @@ use super::config_edit::{
     remove_hook_commands, remove_kimi_config_block, remove_simple_command_hook,
 };
 use super::env::{
-    antigravity_cli_dir, claude_dir, codebuddy_dir, codex_dir, copilot_dir, cursor_dir, devin_dir,
-    droid_dir, grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, mastracode_dir,
-    omp_extension_dir, opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir, workbuddy_dir,
+    antigravity_cli_dir, claude_dir, codebuddy_dir, codex_dir, codexapp_dir, copilot_dir,
+    cursor_dir, devin_dir, droid_dir, grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir,
+    mastracode_dir, omp_extension_dir, opencode_dir, pi_extension_dir, qodercli_dir, qwen_dir,
+    workbuddy_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
@@ -31,23 +32,24 @@ use super::opencode_config::{
 use super::types::{
     AntigravityCliInstallPaths, AntigravityCliUninstallResult, ClaudeInstallPaths,
     ClaudeUninstallResult, CodebuddyInstallPaths, CodebuddyUninstallResult, CodexInstallPaths,
-    CodexUninstallResult, CopilotInstallPaths, CopilotUninstallResult, CursorInstallPaths,
-    CursorUninstallResult, DevinInstallPaths, DevinUninstallResult, DroidInstallPaths,
-    DroidUninstallResult, GrokInstallPaths, GrokUninstallResult, HermesInstallPaths,
-    HermesUninstallResult, KiloInstallPaths, KiloUninstallResult, KimiInstallPaths,
-    KimiUninstallResult, MastracodeInstallPaths, MastracodeUninstallResult, OmpInstallPaths,
-    OmpUninstallResult, OpenCodeInstallPaths, OpenCodeUninstallResult, PiUninstallResult,
-    QodercliInstallPaths, QodercliUninstallResult, QwenInstallPaths, QwenUninstallResult,
-    WorkbuddyInstallPaths, WorkbuddyUninstallResult,
+    CodexUninstallResult, CodexappInstallPaths, CodexappUninstallResult, CopilotInstallPaths,
+    CopilotUninstallResult, CursorInstallPaths, CursorUninstallResult, DevinInstallPaths,
+    DevinUninstallResult, DroidInstallPaths, DroidUninstallResult, GrokInstallPaths,
+    GrokUninstallResult, HermesInstallPaths, HermesUninstallResult, KiloInstallPaths,
+    KiloUninstallResult, KimiInstallPaths, KimiUninstallResult, MastracodeInstallPaths,
+    MastracodeUninstallResult, OmpInstallPaths, OmpUninstallResult, OpenCodeInstallPaths,
+    OpenCodeUninstallResult, PiUninstallResult, QodercliInstallPaths, QodercliUninstallResult,
+    QwenInstallPaths, QwenUninstallResult, WorkbuddyInstallPaths, WorkbuddyUninstallResult,
 };
 use super::{
     ANTIGRAVITY_CLI_HOOK_ASSET, ANTIGRAVITY_CLI_HOOK_BLOCK_NAME, ANTIGRAVITY_CLI_HOOK_EVENTS,
     ANTIGRAVITY_CLI_HOOK_INSTALL_NAME, ANTIGRAVITY_CLI_HOOK_TIMEOUT_SEC, CLAUDE_HOOK_ASSET,
     CLAUDE_HOOK_INSTALL_NAME, CODEBUDDY_HOOK_ASSET, CODEBUDDY_HOOK_EVENTS,
-    CODEBUDDY_HOOK_INSTALL_NAME, CODEBUDDY_REMOVED_LIFECYCLE_HOOK_EVENTS, CODEX_HOOK_ASSET,
-    CODEX_HOOK_INSTALL_NAME, COPILOT_HOOK_ASSET, COPILOT_HOOK_EVENTS, COPILOT_HOOK_INSTALL_NAME,
-    COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS, CURSOR_HOOK_ASSET, CURSOR_HOOK_INSTALL_NAME,
-    DEVIN_HOOK_ASSET, DEVIN_HOOK_EVENTS, DEVIN_HOOK_INSTALL_NAME,
+    CODEBUDDY_HOOK_INSTALL_NAME, CODEBUDDY_REMOVED_LIFECYCLE_HOOK_EVENTS,
+    CODEXAPP_NO_AUTOSPAWN_ENV_VAR, CODEXAPP_WATCH_ASSET, CODEXAPP_WATCH_INSTALL_NAME,
+    CODEX_HOOK_ASSET, CODEX_HOOK_INSTALL_NAME, COPILOT_HOOK_ASSET, COPILOT_HOOK_EVENTS,
+    COPILOT_HOOK_INSTALL_NAME, COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS, CURSOR_HOOK_ASSET,
+    CURSOR_HOOK_INSTALL_NAME, DEVIN_HOOK_ASSET, DEVIN_HOOK_EVENTS, DEVIN_HOOK_INSTALL_NAME,
     DEVIN_REMOVED_LIFECYCLE_HOOK_EVENTS, DROID_HOOK_ASSET, DROID_HOOK_EVENTS,
     DROID_HOOK_INSTALL_NAME, DROID_REMOVED_LIFECYCLE_HOOK_EVENTS, GROK_HOOK_ASSET,
     GROK_HOOK_CONFIG_INSTALL_NAME, GROK_HOOK_INSTALL_NAME, HERMES_PLUGIN_INIT_ASSET,
@@ -900,6 +902,158 @@ pub(crate) fn uninstall_workbuddy() -> io::Result<WorkbuddyUninstallResult> {
     let removed_watch_file = remove_file_if_exists(&watch_path)?;
 
     Ok(WorkbuddyUninstallResult {
+        watch_path,
+        removed_watch_file,
+    })
+}
+
+pub(crate) fn install_codexapp() -> io::Result<CodexappInstallPaths> {
+    let dir = codexapp_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "codex directory not found at {}. install the Codex app first",
+            dir.display()
+        )));
+    }
+
+    let integration_dir = dir.join("herdr");
+    fs::create_dir_all(&integration_dir)?;
+
+    let watch_path = integration_dir.join(CODEXAPP_WATCH_INSTALL_NAME);
+    fs::write(&watch_path, CODEXAPP_WATCH_ASSET)?;
+    make_executable(&watch_path)?;
+
+    let (bridge_pane, bridge_reused) = spawn_codexapp_bridge(&watch_path)
+        .map(|(pane, reused)| (Some(pane), reused))
+        .unwrap_or((None, false));
+
+    Ok(CodexappInstallPaths {
+        watch_path,
+        bridge_pane,
+        bridge_reused,
+    })
+}
+
+/// Best-effort bridge startup. Idempotent: looks for an existing workspace
+/// labeled "Codex" and reuses its root pane; only creates a new workspace when
+/// none exists. Returns `(pane_id, reused)` when a running Herdr server
+/// accepted the spawn. Never fails the install.
+#[cfg(not(windows))]
+fn spawn_codexapp_bridge(watch_path: &Path) -> Option<(String, bool)> {
+    use crate::api::schema::{
+        EmptyParams, Method, PaneListParams, PaneSendInputParams, Request, ResponseResult,
+        WorkspaceCreateParams,
+    };
+
+    if std::env::var_os(CODEXAPP_NO_AUTOSPAWN_ENV_VAR).is_some() {
+        return None;
+    }
+
+    let client = crate::api::client::ApiClient::local();
+    let command = format!(
+        "pkill -f 'herdr-codexapp-watch\\.sh' 2>/dev/null; sh {}",
+        shell_single_quote(&watch_path.display().to_string())
+    );
+
+    let list = client
+        .request(Request {
+            id: "integration:codexapp:list".into(),
+            method: Method::WorkspaceList(EmptyParams::default()),
+        })
+        .ok()?;
+    let ResponseResult::WorkspaceList { workspaces } = list.result else {
+        return None;
+    };
+
+    let existing = workspaces
+        .into_iter()
+        .find(|workspace| workspace.label == "Codex");
+
+    let spawn_result = if let Some(workspace) = existing {
+        let panes = client
+            .request(Request {
+                id: "integration:codexapp:panes".into(),
+                method: Method::PaneList(PaneListParams {
+                    workspace_id: Some(workspace.workspace_id.clone()),
+                }),
+            })
+            .ok()?;
+        let ResponseResult::PaneList { panes } = panes.result else {
+            return None;
+        };
+        panes
+            .into_iter()
+            .next()
+            .map(|pane| pane.pane_id)
+            .or_else(|| {
+                let _ = client.request(Request {
+                    id: "integration:codexapp:focus".into(),
+                    method: Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+                        workspace_id: workspace.workspace_id.clone(),
+                    }),
+                });
+                None
+            })
+            .or_else(|| {
+                let panes = client
+                    .request(Request {
+                        id: "integration:codexapp:panes:after-focus".into(),
+                        method: Method::PaneList(PaneListParams {
+                            workspace_id: Some(workspace.workspace_id.clone()),
+                        }),
+                    })
+                    .ok()?;
+                let ResponseResult::PaneList { panes } = panes.result else {
+                    return None;
+                };
+                panes.into_iter().next().map(|pane| pane.pane_id)
+            })
+            .map(|pane_id| (pane_id, true))
+    } else {
+        let created = client
+            .request(Request {
+                id: "integration:codexapp:workspace".into(),
+                method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                    cwd: None,
+                    focus: false,
+                    label: Some("Codex".into()),
+                    env: Default::default(),
+                }),
+            })
+            .ok()?;
+        let ResponseResult::WorkspaceCreated { root_pane, .. } = created.result else {
+            return None;
+        };
+        Some((root_pane.pane_id, false))
+    };
+
+    let (pane_id, reused) = spawn_result?;
+
+    client
+        .request(Request {
+            id: "integration:codexapp:run".into(),
+            method: Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: command,
+                keys: vec!["Enter".into()],
+            }),
+        })
+        .ok()?;
+
+    Some((pane_id, reused))
+}
+
+#[cfg(windows)]
+fn spawn_codexapp_bridge(_watch_path: &Path) -> Option<(String, bool)> {
+    None
+}
+
+pub(crate) fn uninstall_codexapp() -> io::Result<CodexappUninstallResult> {
+    let dir = codexapp_dir()?;
+    let watch_path = dir.join("herdr").join(CODEXAPP_WATCH_INSTALL_NAME);
+    let removed_watch_file = remove_file_if_exists(&watch_path)?;
+
+    Ok(CodexappUninstallResult {
         watch_path,
         removed_watch_file,
     })

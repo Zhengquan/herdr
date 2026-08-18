@@ -2,14 +2,14 @@ use std::io;
 
 use super::registry::{integration_target_label, integration_target_supported};
 use super::targets::{
-    install_antigravity_cli, install_claude, install_codebuddy, install_codex, install_copilot,
-    install_cursor, install_devin, install_droid, install_grok, install_hermes, install_kilo,
-    install_kimi, install_mastracode, install_omp, install_opencode, install_pi, install_qodercli,
-    install_qwen, install_workbuddy, uninstall_antigravity_cli, uninstall_claude,
-    uninstall_codebuddy, uninstall_codex, uninstall_copilot, uninstall_cursor, uninstall_devin,
-    uninstall_droid, uninstall_grok, uninstall_hermes, uninstall_kilo, uninstall_kimi,
-    uninstall_mastracode, uninstall_omp, uninstall_opencode, uninstall_pi, uninstall_qodercli,
-    uninstall_qwen, uninstall_workbuddy,
+    install_antigravity_cli, install_claude, install_codebuddy, install_codex, install_codexapp,
+    install_copilot, install_cursor, install_devin, install_droid, install_grok, install_hermes,
+    install_kilo, install_kimi, install_mastracode, install_omp, install_opencode, install_pi,
+    install_qodercli, install_qwen, install_workbuddy, uninstall_antigravity_cli, uninstall_claude,
+    uninstall_codebuddy, uninstall_codex, uninstall_codexapp, uninstall_copilot, uninstall_cursor,
+    uninstall_devin, uninstall_droid, uninstall_grok, uninstall_hermes, uninstall_kilo,
+    uninstall_kimi, uninstall_mastracode, uninstall_omp, uninstall_opencode, uninstall_pi,
+    uninstall_qodercli, uninstall_qwen, uninstall_workbuddy,
 };
 use super::version::{agent_version_requirement, enforce_agent_version};
 use super::{KIMI_MIN_VERSION, PI_EXTENSION_INSTALL_NAME};
@@ -280,6 +280,26 @@ fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Re
                 )),
                 (Some(pane_id), false) => messages.push(format!(
                     "started workbuddy bridge in pane {pane_id} of the new \"WorkBuddy\" workspace"
+                )),
+                (None, _) => messages.push(format!(
+                    "no running herdr server found; start the bridge later by running `sh {}` inside any herdr pane",
+                    installed.watch_path.display()
+                )),
+            }
+            messages
+        }
+        crate::api::schema::IntegrationTarget::Codexapp => {
+            let installed = install_codexapp()?;
+            let mut messages = vec![format!(
+                "installed codexapp bridge watcher to {}",
+                installed.watch_path.display()
+            )];
+            match (installed.bridge_pane, installed.bridge_reused) {
+                (Some(pane_id), true) => messages.push(format!(
+                    "restarted codexapp bridge in pane {pane_id} of the existing \"Codex\" workspace"
+                )),
+                (Some(pane_id), false) => messages.push(format!(
+                    "started codexapp bridge in pane {pane_id} of the new \"Codex\" workspace"
                 )),
                 (None, _) => messages.push(format!(
                     "no running herdr server found; start the bridge later by running `sh {}` inside any herdr pane",
@@ -778,6 +798,20 @@ pub(crate) fn uninstall_target(
             } else {
                 vec![format!(
                     "no workbuddy bridge watcher found at {}",
+                    result.watch_path.display()
+                )]
+            }
+        }
+        crate::api::schema::IntegrationTarget::Codexapp => {
+            let result = uninstall_codexapp()?;
+            if result.removed_watch_file {
+                vec![format!(
+                    "removed codexapp bridge watcher at {}; any running bridge exits on its next poll",
+                    result.watch_path.display()
+                )]
+            } else {
+                vec![format!(
+                    "no codexapp bridge watcher found at {}",
                     result.watch_path.display()
                 )]
             }
