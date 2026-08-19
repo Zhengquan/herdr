@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add customizations beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codexapp
-# HERDR_INTEGRATION_VERSION=1
+# HERDR_INTEGRATION_VERSION=2
 #
 # The Codex desktop app never runs inside a Herdr pane, so process detection
 # and screen manifests cannot observe it. This watcher bridges that gap the
@@ -13,20 +13,24 @@
 #
 # Signal model (validated against live Codex app data):
 #   * ~/.codex/sqlite/codex-dev.db -> local_thread_catalog: the thread
-#     directory (id, title, source_kind, source_updated_at in epoch SECONDS).
-#   * ~/.codex/thread-writer-locks/<thread_id>.lock: one lock file per
-#     thread; its mtime tracks the most recent rollout write. A fresh lock
-#     means the thread is actively executing.
+#     directory (id, title, source_kind). source_updated_at is only a
+#     coarse-grained recency hint — it does NOT track execution.
+#   * ~/.codex/thread-writer-locks/<thread_id>.lock: per-thread lock file,
+#     but its mtime is pinned to rollout creation and does NOT refresh during
+#     execution. Not used for state detection.
 #   * ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl: the full
-#     event stream. payload.type task_started / task_complete / turn_aborted
-#     give an explicit turn lifecycle, so completion does not have to be
-#     inferred from status fields.
+#     event stream. The rollout file is appended to every few seconds while a
+#     turn runs (measured 0-4s cadence), so its mtime IS the execution
+#     signal. payload.type task_started / task_complete / turn_aborted give
+#     an explicit turn lifecycle. The LAST lifecycle event wins: a
+#     task_started after a task_complete cancels the earlier completion (the
+#     user started a new turn in the same thread).
 #
 # Sound policy: herdr plays a Done sound on any working->idle transition, so
 # this watcher only produces that transition when it can confirm the tracked
-# turn actually ended (task_complete or turn_aborted in the rollout tail, or
-# the grace window expiring). While waiting for confirmation it holds the
-# reported state at working (no sound).
+# turn actually ended (task_complete or turn_aborted as the last lifecycle
+# event in the rollout tail, or the grace window expiring). While waiting for
+# confirmation it holds the reported state at working (no sound).
 
 set -u
 
@@ -68,16 +72,15 @@ NOW = time.time()
 # generous against the observed multi-second write cadence, tight enough
 # that a finished task goes idle promptly.
 # ---------------------------------------------------------------------------
-LOCK_FRESH_S = 45         # a thread lock mtime this fresh = executing
-CATALOG_FRESH_S = 45      # a thread row whose source_updated_at is this fresh
+ROLLOUT_FRESH_S = 45      # a rollout mtime this fresh = the turn is executing
 HOLD_WORKING_S = 20       # hold working this long waiting for completion confirmation
 ENTER_WORKING_POLLS = 1
 LEAVE_WORKING_POLLS = 3
 GENERIC_POLLS = 2
 TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
-# How many trailing rollout lines to scan for the turn lifecycle. A few
-# hundred is plenty (a busy turn writes dozens of events) and stays cheap.
-ROLLOUT_TAIL_LINES = 200
+LIFECYCLE_EVENTS = {"task_started", "task_complete", "turn_aborted"}
+# How many trailing bytes of a rollout to scan for the last lifecycle event.
+ROLLOUT_TAIL_BYTES = 64 * 1024
 
 
 def send(method, params):
@@ -134,15 +137,6 @@ def load_threads():
         return ("Codex database unreadable", [])
 
 
-def lock_age(thread_id):
-    """Return the age in seconds of a thread's writer lock, or None."""
-    lock_path = os.path.join(codex_home, "thread-writer-locks", f"{thread_id}.lock")
-    try:
-        return NOW - os.path.getmtime(lock_path)
-    except OSError:
-        return None
-
-
 def rollout_path_for(thread_id):
     """Find the most recent rollout JSONL for a thread id."""
     pattern = os.path.join(codex_home, "sessions", "*", "*", "*", f"*-{thread_id}.jsonl")
@@ -152,47 +146,65 @@ def rollout_path_for(thread_id):
     return max(matches, key=os.path.getmtime)
 
 
-def rollout_terminal_event(thread_id):
-    """Return the most recent terminal event type in the rollout tail, or None.
+def rollout_age(thread_id):
+    """Return the age in seconds of the thread's most recent rollout write.
 
-    Scans the trailing lines of the thread's rollout JSONL for a
-    task_complete / turn_aborted payload. Only the tail is read to keep the
-    poll cheap; a genuine completion lands within a few dozen lines of the
-    last event.
+    This is the RELIABLE execution signal: the rollout file is appended to
+    every few seconds while a turn runs (measured 0-4s cadence) and stops
+    when the turn ends. Thread-writer locks do NOT track execution — their
+    mtime is pinned to rollout creation — so they are not used.
     """
     path = rollout_path_for(thread_id)
     if not path:
         return None
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()[-ROLLOUT_TAIL_LINES:]
+        return NOW - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def rollout_last_lifecycle(thread_id):
+    """Return the LAST lifecycle event in the rollout tail, or None.
+
+    Scans backwards through the tail for task_started / task_complete /
+    turn_aborted and returns the most recent one. Crucially this is not just
+    "the last terminal event": a thread can complete one turn and start
+    another in the same rollout, so a task_started after a task_complete must
+    cancel the completion — the last lifecycle event wins.
+    """
+    path = rollout_path_for(thread_id)
+    if not path:
+        return None
+    # Read only the tail bytes; a busy rollout can be megabytes.
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - ROLLOUT_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
     except Exception:
         return None
     latest = None
-    for line in lines:
+    for line in tail.splitlines():
         try:
             event = json.loads(line)
         except Exception:
             continue
         payload = event.get("payload") or {}
         ptype = payload.get("type")
-        if ptype in TERMINAL_EVENTS:
+        if ptype in LIFECYCLE_EVENTS:
             latest = ptype
     return latest
 
 
 def is_active(row):
-    """A thread is active when both its catalog row and its writer lock are fresh."""
-    thread_id, _title, _kind, updated_at = row
-    if updated_at is None:
+    """A thread is executing when its rollout was written recently AND its
+    last lifecycle event is not a terminal one."""
+    thread_id = row[0]
+    age = rollout_age(thread_id)
+    if age is None or age >= ROLLOUT_FRESH_S:
         return False
-    try:
-        if NOW - float(updated_at) >= CATALOG_FRESH_S:
-            return False
-    except (TypeError, ValueError):
-        return False
-    age = lock_age(thread_id)
-    return age is not None and age < LOCK_FRESH_S
+    return rollout_last_lifecycle(thread_id) not in TERMINAL_EVENTS
 
 
 def short_title(title):
@@ -244,6 +256,12 @@ def fmt_age(seconds):
         secs = max(0, int(NOW - float(seconds)))
     except Exception:
         return ""
+    return fmt_age_from_age(secs)
+
+
+def fmt_age_from_age(secs):
+    """Format an age in seconds as a compact relative string."""
+    secs = max(0, int(secs))
     if secs < 60:
         return f"{secs}s"
     mins = secs // 60
@@ -355,13 +373,13 @@ def render_dashboard(state, rows, error, confirming):
             if active:
                 icon, icolor, badge = ROW_ICONS["active"]
             else:
-                terminal = rollout_terminal_event(thread_id)
-                age = NOW - float(updated_at) if updated_at else None
-                if terminal == "task_complete" and age is not None and age < 300:
+                last_event = rollout_last_lifecycle(thread_id)
+                r_age = rollout_age(thread_id)
+                if last_event == "task_complete" and r_age is not None and r_age < 300:
                     icon, icolor, badge = ROW_ICONS["recent"]
-                elif terminal == "turn_aborted" and age is not None and age < 300:
+                elif last_event == "turn_aborted" and r_age is not None and r_age < 300:
                     icon, icolor, badge = ROW_ICONS["aborted"]
-                elif age is not None and age < CATALOG_FRESH_S:
+                elif r_age is not None and r_age < ROLLOUT_FRESH_S:
                     icon, icolor, badge = ROW_ICONS["stale"]
                 else:
                     icon, icolor, badge = ROW_ICONS["old"]
@@ -374,7 +392,10 @@ def render_dashboard(state, rows, error, confirming):
                 " " * (status_pad if status_pad > 0 else 0)
             )
 
-            when = fmt_age(updated_at)
+            # Prefer the rollout age (accurate to seconds) over the catalog
+            # timestamp (coarse) for the WHEN column.
+            r_age_display = rollout_age(thread_id)
+            when = fmt_age_from_age(r_age_display) if r_age_display is not None else fmt_age(updated_at)
             when_v = dpad(when, COL_WHEN)
 
             kind_tag = f" [{source_kind}]" if source_kind else ""
@@ -426,9 +447,12 @@ elif active_row is not None:
     last_active_seen_ms = int(NOW * 1000)
     state, message = ("working", short_title(active_row[1]))
 elif tracked_row is not None:
-    # The active thread disappeared; check its rollout for a terminal event.
-    terminal = rollout_terminal_event(tracked_id)
-    if terminal in TERMINAL_EVENTS:
+    # The tracked thread's rollout is no longer fresh; check whether its
+    # last lifecycle event is terminal. A task_started after an earlier
+    # task_complete means the user started a new turn, so last-event-wins
+    # prevents a stale completion from masking the new turn.
+    last_event = rollout_last_lifecycle(tracked_id)
+    if last_event in TERMINAL_EVENTS:
         # Confirmed completion (or user abort). Produce the working->idle
         # transition that fires the Done sound exactly once.
         confirmed_completion = True

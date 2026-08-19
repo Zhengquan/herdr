@@ -268,7 +268,7 @@ const WORKBUDDY_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_WORKBUDDY_NO_AUTOSPAWN";
 /// distinct from `Agent::Codex`, which detects the Codex CLI inside a pane.
 const CODEXAPP_WATCH_INSTALL_NAME: &str = "herdr-codexapp-watch.sh";
 const CODEXAPP_WATCH_ASSET: &str = include_str!("assets/codexapp/herdr-codexapp-watch.sh");
-const CODEXAPP_INTEGRATION_VERSION: u32 = 1;
+const CODEXAPP_INTEGRATION_VERSION: u32 = 2;
 /// Skip the bridge-pane auto-spawn (test seam; also honored for users who
 /// only want the watcher script installed).
 const CODEXAPP_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_CODEXAPP_NO_AUTOSPAWN";
