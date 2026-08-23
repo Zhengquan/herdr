@@ -19,12 +19,11 @@
 #     but its mtime is pinned to rollout creation and does NOT refresh during
 #     execution. Not used for state detection.
 #   * ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl: the full
-#     event stream. The rollout file is appended to every few seconds while a
-#     turn runs (measured 0-4s cadence), so its mtime IS the execution
-#     signal. payload.type task_started / task_complete / turn_aborted give
-#     an explicit turn lifecycle. The LAST lifecycle event wins: a
-#     task_started after a task_complete cancels the earlier completion (the
-#     user started a new turn in the same thread).
+#     event stream. payload.type task_started / task_complete / turn_aborted
+#     gives an explicit turn lifecycle. The LAST lifecycle event is the
+#     authority: task_started stays active until a terminal event arrives.
+#     File freshness is only a fallback for legacy/incomplete event streams;
+#     long tool calls can leave an active rollout unchanged for minutes.
 #
 # Sound policy: herdr plays a Done sound on any working->idle transition, so
 # this watcher only produces that transition when it can confirm the tracked
@@ -67,10 +66,22 @@ state_file = os.environ["HERDR_CODEXAPP_STATE_FILE"]
 
 NOW = time.time()
 
+try:
+    with open(state_file, encoding="utf-8") as handle:
+        persisted = json.load(handle)
+except Exception:
+    persisted = {}
+
+lifecycle_cursors = persisted.get("lifecycle_cursors")
+if not isinstance(lifecycle_cursors, dict):
+    lifecycle_cursors = {}
+rollout_paths = {}
+lifecycle_results = {}
+
 # ---------------------------------------------------------------------------
-# Tunables. The active window matches the WorkBuddy bridge's window (45s) —
-# generous against the observed multi-second write cadence, tight enough
-# that a finished task goes idle promptly.
+# Tunables. The freshness window is only used when a rollout has no explicit
+# lifecycle event. Explicit task_started remains active until task_complete or
+# turn_aborted, including across long tool calls that produce no rollout writes.
 # ---------------------------------------------------------------------------
 ROLLOUT_FRESH_S = 45      # a rollout mtime this fresh = the turn is executing
 HOLD_WORKING_S = 20       # hold working this long waiting for completion confirmation
@@ -79,8 +90,7 @@ LEAVE_WORKING_POLLS = 3
 GENERIC_POLLS = 2
 TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
 LIFECYCLE_EVENTS = {"task_started", "task_complete", "turn_aborted"}
-# How many trailing bytes of a rollout to scan for the last lifecycle event.
-ROLLOUT_TAIL_BYTES = 64 * 1024
+ROLLOUT_SCAN_BYTES = 64 * 1024
 
 
 def send(method, params):
@@ -139,20 +149,25 @@ def load_threads():
 
 def rollout_path_for(thread_id):
     """Find the most recent rollout JSONL for a thread id."""
+    if thread_id in rollout_paths:
+        return rollout_paths[thread_id]
     pattern = os.path.join(codex_home, "sessions", "*", "*", "*", f"*-{thread_id}.jsonl")
     matches = glob.glob(pattern)
     if not matches:
+        rollout_paths[thread_id] = None
         return None
-    return max(matches, key=os.path.getmtime)
+    path = max(matches, key=os.path.getmtime)
+    rollout_paths[thread_id] = path
+    return path
 
 
 def rollout_age(thread_id):
     """Return the age in seconds of the thread's most recent rollout write.
 
-    This is the RELIABLE execution signal: the rollout file is appended to
-    every few seconds while a turn runs (measured 0-4s cadence) and stops
-    when the turn ends. Thread-writer locks do NOT track execution — their
-    mtime is pinned to rollout creation — so they are not used.
+    This is only a compatibility fallback when no explicit lifecycle event is
+    present. Long tool calls can leave an executing rollout unchanged well
+    beyond the freshness window. Thread-writer locks do not track execution —
+    their mtime is pinned to rollout creation — so they are not used.
     """
     path = rollout_path_for(thread_id)
     if not path:
@@ -164,47 +179,124 @@ def rollout_age(thread_id):
 
 
 def rollout_last_lifecycle(thread_id):
-    """Return the LAST lifecycle event in the rollout tail, or None.
+    """Return the LAST lifecycle event, incrementally cached across polls.
 
-    Scans backwards through the tail for task_started / task_complete /
-    turn_aborted and returns the most recent one. Crucially this is not just
-    "the last terminal event": a thread can complete one turn and start
-    another in the same rollout, so a task_started after a task_complete must
-    cancel the completion — the last lifecycle event wins.
+    The initial lookup scans backwards and stops at the first lifecycle event.
+    Later polls only parse bytes appended since that lookup. This keeps an old
+    task_complete from masking a new task_started without repeatedly scanning
+    a large active rollout from the beginning.
     """
     path = rollout_path_for(thread_id)
     if not path:
         return None
-    # Read only the tail bytes; a busy rollout can be megabytes.
     try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - ROLLOUT_TAIL_BYTES))
-            tail = handle.read().decode("utf-8", errors="replace")
-    except Exception:
+        stat = os.stat(path)
+    except OSError:
         return None
-    latest = None
-    for line in tail.splitlines():
+
+    # Ignore a trailing partial JSONL record if the poll races a writer. Keep
+    # the cursor at the last newline so the completed record is retried later.
+    complete_offset = stat.st_size
+    if complete_offset > 0:
         try:
-            event = json.loads(line)
+            with open(path, "rb") as handle:
+                handle.seek(complete_offset - 1)
+                if handle.read(1) != b"\n":
+                    position = complete_offset
+                    complete_offset = 0
+                    while position > 0:
+                        amount = min(ROLLOUT_SCAN_BYTES, position)
+                        position -= amount
+                        handle.seek(position)
+                        block = handle.read(amount)
+                        newline = block.rfind(b"\n")
+                        if newline >= 0:
+                            complete_offset = position + newline + 1
+                            break
+        except OSError:
+            return None
+
+    signature = (path, stat.st_ino, complete_offset)
+    cached_result = lifecycle_results.get(thread_id)
+    if cached_result and cached_result[0] == signature:
+        return cached_result[1]
+
+    def lifecycle_from_line(raw):
+        try:
+            event = json.loads(raw.decode("utf-8", errors="replace"))
         except Exception:
-            continue
+            return None
         payload = event.get("payload") or {}
         ptype = payload.get("type")
-        if ptype in LIFECYCLE_EVENTS:
-            latest = ptype
+        return ptype if ptype in LIFECYCLE_EVENTS else None
+
+    cursor = lifecycle_cursors.get(thread_id)
+    cursor_valid = (
+        isinstance(cursor, dict)
+        and cursor.get("path") == path
+        and cursor.get("device") == stat.st_dev
+        and cursor.get("inode") == stat.st_ino
+        and isinstance(cursor.get("offset"), int)
+        and 0 <= cursor["offset"] <= complete_offset
+    )
+
+    if cursor_valid:
+        latest = cursor.get("lifecycle")
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(cursor["offset"])
+                appended = handle.read(complete_offset - cursor["offset"])
+                for line in appended.splitlines():
+                    event = lifecycle_from_line(line)
+                    if event:
+                        latest = event
+        except OSError:
+            return None
+    else:
+        latest = None
+        # Read blocks from newest to oldest and stop as soon as the latest
+        # lifecycle line is found. `carry` joins a line split across blocks.
+        try:
+            with open(path, "rb") as handle:
+                position = complete_offset
+                carry = b""
+                while position > 0 and latest is None:
+                    amount = min(ROLLOUT_SCAN_BYTES, position)
+                    position -= amount
+                    handle.seek(position)
+                    block = handle.read(amount) + carry
+                    lines = block.split(b"\n")
+                    carry = lines[0]
+                    for line in reversed(lines[1:]):
+                        latest = lifecycle_from_line(line)
+                        if latest:
+                            break
+                if latest is None and carry:
+                    latest = lifecycle_from_line(carry)
+        except OSError:
+            return None
+
+    lifecycle_cursors[thread_id] = {
+        "path": path,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "offset": complete_offset,
+        "lifecycle": latest,
+    }
+    lifecycle_results[thread_id] = (signature, latest)
     return latest
 
 
 def is_active(row):
-    """A thread is executing when its rollout was written recently AND its
-    last lifecycle event is not a terminal one."""
+    """Prefer explicit lifecycle; use freshness only when it is unavailable."""
     thread_id = row[0]
-    age = rollout_age(thread_id)
-    if age is None or age >= ROLLOUT_FRESH_S:
+    lifecycle = rollout_last_lifecycle(thread_id)
+    if lifecycle == "task_started":
+        return True
+    if lifecycle in TERMINAL_EVENTS:
         return False
-    return rollout_last_lifecycle(thread_id) not in TERMINAL_EVENTS
+    age = rollout_age(thread_id)
+    return age is not None and age < ROLLOUT_FRESH_S
 
 
 def short_title(title):
@@ -425,12 +517,6 @@ POLL_HINT = os.environ.get("HERDR_CODEXAPP_POLL_INTERVAL", "3")
 # ===========================================================================
 error, rows = load_threads()
 
-try:
-    with open(state_file, encoding="utf-8") as handle:
-        persisted = json.load(handle)
-except Exception:
-    persisted = {}
-
 tracked_id = persisted.get("tracked_id")
 last_active_seen_ms = persisted.get("last_active_seen_ms")
 confirming = False
@@ -522,6 +608,12 @@ else:
 
 persisted["tracked_id"] = tracked_id
 persisted["last_active_seen_ms"] = last_active_seen_ms
+known_thread_ids = {row[0] for row in rows}
+persisted["lifecycle_cursors"] = {
+    thread_id: cursor
+    for thread_id, cursor in lifecycle_cursors.items()
+    if thread_id in known_thread_ids
+}
 
 try:
     with open(state_file, "w", encoding="utf-8") as handle:
