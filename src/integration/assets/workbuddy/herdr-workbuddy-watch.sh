@@ -3,21 +3,20 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add customizations beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=workbuddy
-# HERDR_INTEGRATION_VERSION=6
+# HERDR_INTEGRATION_VERSION=7
 #
 # WorkBuddy is a standalone macOS desktop app: it never runs inside a Herdr
 # pane, so process detection and screen manifests cannot observe it. This
 # watcher bridges that gap. It runs inside a Herdr pane, polls WorkBuddy's
-# local session database read-only, renders a live task dashboard into the
-# pane, and reports the aggregated state over the Herdr socket API.
+# local state read-only, renders a live task dashboard into the pane, and
+# reports the aggregated state over the Herdr socket API.
 #
 # Sound policy: herdr plays a Done sound on any working→idle transition. For
 # a CLI agent that return is always a real completion, but for WorkBuddy
 # (long-lived app, many sessions) an idle reading is not necessarily a
-# completion. So this watcher only produces a working→idle transition when it
-# can confirm the tracked task actually reached a terminal status
-# (completed/failed/...) with a fresh updated_at. While it waits for that
-# confirmation it holds the reported state at working (no sound); if
+# completion. So this watcher only produces a working→idle transition when the
+# tracked session's transcript shows a settled turn end. While it waits for
+# that confirmation it holds the reported state at working (no sound); if
 # confirmation never arrives within a grace window it falls back to idle once.
 
 set -u
@@ -37,6 +36,7 @@ while true; do
   [ -f "$0" ] || exit 0
 
   HERDR_WORKBUDDY_DB="$DB_PATH" HERDR_WORKBUDDY_HOME="$WORKBUDDY_HOME_DIR" HERDR_WORKBUDDY_STATE_FILE="$STATE_FILE" python3 - <<'PY'
+import glob
 import json
 import os
 import random
@@ -58,34 +58,45 @@ NOW = time.time()
 NOW_MS = NOW * 1000
 
 # ---------------------------------------------------------------------------
-# Signal model (validated against live WorkBuddy data)
+# Signal model (validated against live WorkBuddy 2.132.x data)
 # ---------------------------------------------------------------------------
-# * A session that is genuinely executing cycles its DB `status` between
-#   'working' and 'planning' (and occasionally other active verbs) while its
-#   `updated_at` keeps advancing every few seconds. This is the RELIABLE
-#   "task is running" signal.
-# * When a task finishes, WorkBuddy writes a terminal status ('completed' /
-#   'Failed' / 'Terminated' / ...) and refreshes that row's `updated_at`. A
-#   terminal row with a fresh updated_at is the RELIABLE "task just finished"
-#   signal — and it is what authorizes a working→idle transition (and thus the
-#   Done sound).
-# * The interactive engine heartbeat file (<pid>.json mtime) is NOT reliable
-#   for execution detection: it drifts up to ~30s stale during genuine
-#   execution. It is kept only as a loose phantom guard that rejects a
-#   prewarm-only pool worker.
+# * `sessions.status` in workbuddy.db is NOT an execution signal. A genuinely
+#   executing session keeps the status it was left with — in practice
+#   'completed' — so status alone reports every running task as finished.
+#   The table is still the session directory: ids, titles, cwd, ordering.
+# * ~/.workbuddy/projects/<cwd-slug>/<session_id>.jsonl is the conversation
+#   transcript and it IS authoritative for turn lifecycle. Records are
+#   appended in turn order: a user `message` starts a turn, then `reasoning`,
+#   `function_call`, `function_call_result` and `file-history-snapshot`
+#   records stream while work happens, and the turn ends with an assistant
+#   `message` (status 'completed', or 'incomplete' when interrupted). Every
+#   assistant text block is written as a completed `message`, so only the
+#   LAST record in the file distinguishes a finished turn from a mid-turn
+#   narration that is about to be followed by another tool call.
+# * ~/.workbuddy/sessions/<pid>.json is a per-host heartbeat carrying the
+#   conversation id it serves. It is not an execution signal — a host stays
+#   alive while its conversation sits idle — but a missing host proves the
+#   conversation cannot be executing, which retires transcripts abandoned
+#   mid-turn by a crash.
 # ---------------------------------------------------------------------------
-ACTIVE_STATUSES = ("working", "planning", "running", "executing", "in_progress")
-TERMINAL_STATUSES = {
-    "completed", "failed", "terminated", "error", "archived", "cancelled",
-}
-ACTIVE_UPDATED_S = 45       # an active row whose updated_at is this fresh = executing
-COMPLETION_FRESH_S = 45     # a terminal row whose updated_at is this fresh = just finished
-HOLD_WORKING_S = 20         # hold working this long waiting for completion confirmation
-ENGINE_LIVE_S = 60          # loose host-alive window (heartbeat drifts a lot)
-FAILED_RECENT_MS = 30 * 60_000
+IN_FLIGHT = "in_flight"
+TURN_END = "turn_end"
+DB_FAILED_STATUSES = {"failed", "error"}
+DB_STOPPED_STATUSES = {"terminated", "cancelled"}
+TRANSCRIPT_FRESH_S = 45     # no readable turn record: treat fresh writes as work
+SETTLE_S = 4                # a turn end must be this old to confirm completion
+ABANDONED_TURN_S = 120      # in-flight transcript with no live host: give up
+HOST_LIVE_S = 60            # heartbeat window for "this conversation has a host"
+HOLD_WORKING_S = 20         # hold working this long waiting for confirmation
 ENTER_WORKING_POLLS = 1     # confirmations required to ENTER working (report quickly)
-LEAVE_WORKING_POLLS = 3     # confirmations to LEAVE working on a *fallback* (absorb blips)
+LEAVE_WORKING_POLLS = 3     # confirmations to LEAVE working on a *fallback*
 GENERIC_POLLS = 2           # confirmations for any other transition
+TAIL_BLOCK_BYTES = 64 * 1024
+MAX_TAIL_BYTES = 4 * 1024 * 1024
+
+transcript_paths = {}
+transcript_stats = {}
+turn_states = {}
 
 
 def send(method, params):
@@ -107,13 +118,13 @@ def send(method, params):
 
 def load_sessions():
     """Return (error_or_None, rows) where each row is
-    (id, status, title, last_activity_at, updated_at)."""
+    (id, status, title, last_activity_at, updated_at, cwd)."""
     if not os.path.isfile(db_path):
         return ("WorkBuddy database not found", [])
     try:
         db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         rows = db.execute(
-            "SELECT id, status, title, last_activity_at, updated_at FROM sessions "
+            "SELECT id, status, title, last_activity_at, updated_at, cwd FROM sessions "
             "WHERE deleted_at IS NULL AND status != 'archived' "
             "ORDER BY updated_at DESC LIMIT 20"
         ).fetchall()
@@ -123,23 +134,20 @@ def load_sessions():
         return ("WorkBuddy database unreadable", [])
 
 
-def engine_live():
-    """True while at least one real (non-prewarm, non-idle) WorkBuddy host is
-    present. Used only as a weak phantom guard, with a loose window because the
-    interactive heartbeat mtime drifts substantially during execution.
-    """
+def load_hosts():
+    """Return the set of conversation ids with a fresh host heartbeat."""
+    live = set()
     sessions_dir = os.path.join(workbuddy_home, "sessions")
     try:
         names = os.listdir(sessions_dir)
     except Exception:
-        return False
+        return live
     for name in names:
         if not name.endswith(".json"):
             continue
         path = os.path.join(sessions_dir, name)
         try:
-            if NOW - os.path.getmtime(path) >= ENGINE_LIVE_S:
-                continue
+            mtime = os.path.getmtime(path)
         except OSError:
             continue
         try:
@@ -147,13 +155,135 @@ def engine_live():
                 data = json.load(handle)
         except Exception:
             continue
-        if str(data.get("kind", "")).lower() == "prewarm":
+        if not isinstance(data, dict):
             continue
-        meta = data.get("meta") or {}
-        if str(meta.get("status", "")).lower() == "idle":
+        beat = data.get("lastHeartbeat")
+        try:
+            beat_s = float(beat) / 1000
+        except Exception:
+            beat_s = mtime
+        if NOW - max(beat_s, mtime) >= HOST_LIVE_S:
             continue
-        return True
-    return False
+        session_id = data.get("sessionId")
+        if session_id:
+            live.add(str(session_id))
+    return live
+
+
+def transcript_path(session_id, cwd):
+    """Locate a session's transcript. WorkBuddy slugs the working directory by
+    replacing path separators with dashes, so the path is derived directly and
+    only falls back to a scan when that derivation misses."""
+    if session_id in transcript_paths:
+        return transcript_paths[session_id]
+    path = None
+    projects_dir = os.path.join(workbuddy_home, "projects")
+    if cwd:
+        slug = str(cwd).replace("\\", "-").replace("/", "-").lstrip("-")
+        candidate = os.path.join(projects_dir, slug, f"{session_id}.jsonl")
+        if os.path.isfile(candidate):
+            path = candidate
+    if path is None:
+        matches = glob.glob(os.path.join(projects_dir, "*", f"{session_id}.jsonl"))
+        if matches:
+            path = max(matches, key=os.path.getmtime)
+    transcript_paths[session_id] = path
+    return path
+
+
+def transcript_stat(session_id, cwd):
+    """Return (age_seconds, size_bytes) for a session's transcript."""
+    if session_id in transcript_stats:
+        return transcript_stats[session_id]
+    result = (None, 0)
+    path = transcript_path(session_id, cwd)
+    if path:
+        try:
+            stat = os.stat(path)
+            result = (NOW - stat.st_mtime, stat.st_size)
+        except OSError:
+            result = (None, 0)
+    transcript_stats[session_id] = result
+    return result
+
+
+def last_complete_record(path, size):
+    """Return the last fully written JSONL record of a transcript.
+
+    Records are read backwards a block at a time so an active transcript costs
+    one small read regardless of its length. Bytes after the final newline are
+    a record still being appended, so they are skipped: the previous record is
+    the newest one that is safe to classify.
+    """
+    if size <= 0:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            position = size
+            tail = b""
+            while position > 0 and len(tail) < MAX_TAIL_BYTES:
+                amount = min(TAIL_BLOCK_BYTES, position)
+                position -= amount
+                handle.seek(position)
+                tail = handle.read(amount) + tail
+                lines = tail.split(b"\n")
+                # lines[-1] follows the last newline and may be a partial
+                # append; lines[0] is only whole when the read reached the
+                # start of the file.
+                bounded = lines[:-1] if position == 0 else lines[1:-1]
+                for line in reversed(bounded):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    if isinstance(record, dict):
+                        return record
+    except OSError:
+        return None
+    return None
+
+
+def turn_state(session_id, cwd):
+    """Return (kind, message_status, age_seconds) for a session's last turn.
+
+    `kind` is TURN_END once the transcript's last record is an assistant
+    message, IN_FLIGHT while any other record is last, and None when no
+    transcript record can be read.
+    """
+    if session_id in turn_states:
+        return turn_states[session_id]
+    age, size = transcript_stat(session_id, cwd)
+    path = transcript_path(session_id, cwd)
+    kind = None
+    status = None
+    if path:
+        record = last_complete_record(path, size)
+        if record is not None:
+            if record.get("type") == "message" and record.get("role") == "assistant":
+                kind = TURN_END
+                status = str(record.get("status") or "").lower()
+            else:
+                kind = IN_FLIGHT
+    result = (kind, status, age)
+    turn_states[session_id] = result
+    return result
+
+
+def session_active(row, live_hosts):
+    """True while a session's transcript shows a turn still in flight."""
+    session_id = row[0]
+    kind, _status, age = turn_state(session_id, row[5])
+    if kind == TURN_END:
+        return False
+    if kind == IN_FLIGHT:
+        if session_id in live_hosts:
+            # A tool call can run for minutes without a transcript write, so an
+            # in-flight turn stays working as long as its host is alive.
+            return True
+        return age is not None and age < ABANDONED_TURN_S
+    return age is not None and age < TRANSCRIPT_FRESH_S
 
 
 def age_ms(value):
@@ -163,28 +293,13 @@ def age_ms(value):
         return float("inf")
 
 
-def is_active_status(status):
-    return str(status).lower() in ACTIVE_STATUSES
-
-
-def is_terminal_status(status):
-    return str(status).lower() in TERMINAL_STATUSES
-
-
-def find_active_row(rows):
-    for r in rows:
-        if is_active_status(r[1]) and age_ms(r[4]) < ACTIVE_UPDATED_S * 1000:
-            return r
-    return None
-
-
-def find_row_by_id(rows, row_id):
-    if not row_id:
-        return None
-    for r in rows:
-        if r[0] == row_id:
-            return r
-    return None
+def effective_age_s(row):
+    """Seconds since a session last showed any activity."""
+    age, _size = transcript_stat(row[0], row[5])
+    db_age = age_ms(row[4]) / 1000
+    if age is None:
+        return db_age
+    return min(age, db_age)
 
 
 def short_title(title):
@@ -196,7 +311,6 @@ def short_title(title):
 # ===========================================================================
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
-DIM = "\x1b[2m"
 
 
 def fg(code):
@@ -210,7 +324,6 @@ def bg(code):
 C_ACCENT = 39
 C_ACCENT2 = 45
 C_GREEN = 42
-C_BLUE = 75
 C_RED = 203
 C_AMBER = 214
 C_MUTE = 244
@@ -224,21 +337,32 @@ STATE_THEME = {
 }
 
 ROW_ICONS = {
-    "working": ("▶", C_GREEN, "running"),
     "running": ("▶", C_GREEN, "running"),
-    "executing": ("▶", C_GREEN, "running"),
-    "in_progress": ("▶", C_GREEN, "running"),
-    "planning": ("◐", C_BLUE, "planning"),
-    "error": ("✕", C_RED, "failed"),
+    "done": ("✓", C_MUTE, "done"),
     "failed": ("✕", C_RED, "failed"),
-    "terminated": ("⊘", C_MUTE, "stopped"),
-    "completed": ("✓", C_MUTE, "done"),
+    "stopped": ("⊘", C_AMBER, "stopped"),
+    "unknown": ("◇", C_FAINT, "idle"),
 }
 
 
-def fmt_age(ms):
+def row_badge(row, live_hosts):
+    """Pick the STATUS column glyph for a session row."""
+    if session_active(row, live_hosts):
+        return ROW_ICONS["running"]
+    db_status = str(row[1] or "").lower()
+    if db_status in DB_FAILED_STATUSES:
+        return ROW_ICONS["failed"]
+    if db_status in DB_STOPPED_STATUSES:
+        return ROW_ICONS["stopped"]
+    kind, status, _age = turn_state(row[0], row[5])
+    if kind == TURN_END:
+        return ROW_ICONS["stopped"] if status == "incomplete" else ROW_ICONS["done"]
+    return ROW_ICONS["unknown"]
+
+
+def fmt_age_from_age(secs):
     try:
-        secs = max(0, int((NOW_MS - int(ms)) / 1000))
+        secs = max(0, int(secs))
     except Exception:
         return ""
     if secs < 60:
@@ -288,7 +412,7 @@ COL_STATUS = 11
 COL_WHEN = 7
 
 
-def render_dashboard(state, rows, error, live, confirming):
+def render_dashboard(state, rows, error, live, confirming, live_hosts):
     color, label, glyph = STATE_THEME.get(state, STATE_THEME["idle"])
     accent = fg(C_ACCENT)
     a2 = fg(C_ACCENT2)
@@ -347,18 +471,7 @@ def render_dashboard(state, rows, error, live, confirming):
         prefix_cols = 2 + COL_STATUS + 2 + COL_WHEN + 2
         task_budget = inner - prefix_cols
         for r in rows[:12]:
-            _id, status, title, last_act, updated = r
-            name = str(status).lower()
-            fresh_active = is_active_status(name) and age_ms(updated) < ACTIVE_UPDATED_S * 1000
-            just_done = is_terminal_status(name) and age_ms(updated) < COMPLETION_FRESH_S * 1000
-            if fresh_active:
-                icon, icolor, badge = ROW_ICONS.get(name, ("▶", C_GREEN, "running"))
-            elif just_done and name in ("failed", "error"):
-                icon, icolor, badge = "✕", C_RED, "failed"
-            elif just_done:
-                icon, icolor, badge = "✓", C_GREEN, "done"
-            else:
-                icon, icolor, badge = ROW_ICONS.get(name, ("◇", C_FAINT, name[:COL_STATUS - 2]))
+            icon, icolor, badge = row_badge(r, live_hosts)
             ic = fg(icolor)
 
             status_field = f"{icon} {badge}"
@@ -368,17 +481,17 @@ def render_dashboard(state, rows, error, live, confirming):
                 " " * (status_pad if status_pad > 0 else 0)
             )
 
-            when = fmt_age(last_act)
+            when = fmt_age_from_age(effective_age_s(r))
             when_v = dpad(when, COL_WHEN)
 
-            task = dtrunc(str(title or "(untitled)").replace("\n", " "), task_budget)
+            task = dtrunc(str(r[2] or "(untitled)").replace("\n", " "), task_budget)
             line_v = f"  {status_v}  {when_v}  {task}"
             line_a = f"  {status_a}  {faint}{when_v}{RESET}  {text}{task}{RESET}"
             lines.append(row(dwidth(line_v), line_a))
 
     lines.append(row(0, ""))
     total = len(rows)
-    running = sum(1 for r in rows if is_active_status(r[1])) if rows else 0
+    running = sum(1 for r in rows if session_active(r, live_hosts)) if rows else 0
     foot_v = f"  {total} sessions · {running} active · poll {POLL_HINT}s"
     foot_a = f"  {faint}{total} sessions · {running} active · poll {POLL_HINT}s{RESET}"
     lines.append(sep)
@@ -396,7 +509,10 @@ POLL_HINT = os.environ.get("HERDR_WORKBUDDY_POLL_INTERVAL", "3")
 # Aggregate with completion confirmation
 # ===========================================================================
 error, rows = load_sessions()
-live = engine_live()
+live_hosts = load_hosts()
+live = bool(live_hosts)
+if rows:
+    rows.sort(key=effective_age_s)
 
 try:
     with open(state_file, encoding="utf-8") as handle:
@@ -407,45 +523,44 @@ except Exception:
 tracked_id = persisted.get("tracked_id")
 last_active_seen_ms = persisted.get("last_active_seen_ms")
 
-active = find_active_row(rows)
-tracked = find_row_by_id(rows, tracked_id)
+active = next((r for r in rows if session_active(r, live_hosts)), None)
+tracked = next((r for r in rows if r[0] == tracked_id), None) if tracked_id else None
 confirming = False
 confirmed_completion = False
 
 if error:
     state, message = ("idle", error)
 elif active is not None:
-    # A task is genuinely running: track it and report working.
+    # A turn is genuinely in flight: track it and report working.
     tracked_id = active[0]
     last_active_seen_ms = NOW_MS
     state, message = ("working", short_title(active[2]))
-elif tracked is not None and is_terminal_status(tracked[1]) and age_ms(tracked[4]) < COMPLETION_FRESH_S * 1000:
-    # The task we were tracking just reached a terminal status with a fresh
-    # updated_at: this is a confirmed completion. Produce the working→idle
-    # transition that fires the Done sound exactly once.
-    confirmed_completion = True
-    state, message = ("idle", short_title(tracked[2]))
-    tracked_id = None
-elif tracked_id is not None and last_active_seen_ms and (NOW_MS - last_active_seen_ms) < HOLD_WORKING_S * 1000:
-    # The active row disappeared but we have not yet seen a terminal status.
-    # Hold the reported state at working (no idle → no sound) while we wait a
-    # brief grace window for the completion write to land.
-    confirming = True
-    state, message = ("working", short_title(tracked[2] if tracked else None))
+elif tracked is not None:
+    kind, _status, age = turn_state(tracked_id, tracked[5])
+    if kind == TURN_END and age is not None and age >= SETTLE_S:
+        # The tracked session's transcript ends with an assistant message that
+        # has stopped being followed by tool calls, so the turn really is over.
+        # Produce the working→idle transition that fires the Done sound once.
+        confirmed_completion = True
+        state, message = ("idle", short_title(tracked[2]))
+        tracked_id = None
+    elif last_active_seen_ms and (NOW_MS - last_active_seen_ms) < HOLD_WORKING_S * 1000:
+        # A mid-turn assistant message is followed by its tool call within
+        # milliseconds, so an unsettled turn end is indistinguishable from
+        # ongoing work. Hold working (no idle → no sound) until it settles.
+        confirming = True
+        state, message = ("working", short_title(tracked[2]))
+    else:
+        # Grace window expired without a settled turn end. Fall back to idle.
+        state, message = ("idle", short_title(tracked[2]))
+        tracked_id = None
 else:
-    # No active task and either no tracked session or the grace window has
-    # expired. Fall back to idle. If herdr's previous state was working this
-    # will fire Done once — acceptable, because a task likely ended without a
-    # clean terminal write (or the watcher was just started).
-    fallback_title = None
-    if tracked is not None:
-        fallback_title = tracked[2]
-    elif rows:
-        fallback_title = rows[0][2]
+    # No in-flight turn and nothing tracked.
+    fallback_title = rows[0][2] if rows else None
     state, message = ("idle", short_title(fallback_title) if fallback_title else None)
     tracked_id = None
 
-render_dashboard(state, rows, error, live, confirming)
+render_dashboard(state, rows, error, live, confirming, live_hosts)
 
 candidate = f"{state}:{message or ''}"
 reported = persisted.get("reported")
