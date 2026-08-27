@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add customizations beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codexapp
-# HERDR_INTEGRATION_VERSION=2
+# HERDR_INTEGRATION_VERSION=3
 #
 # The Codex desktop app never runs inside a Herdr pane, so process detection
 # and screen manifests cannot observe it. This watcher bridges that gap the
@@ -420,13 +420,16 @@ def render_dashboard(state, rows, error, confirming):
             pad = 0
         return f"{accent}│{RESET}{content_ansi}{' ' * pad}{accent}│{RESET}"
 
+    # right_v must include every visible glyph in right_a (dot + hold_hint),
+    # or row() padding pushes the right border out by that many columns.
+    dot_v = "●" if state == "working" else "○"
     dot = f"{fg(C_GREEN)}●{RESET}" if state == "working" else f"{faint}○{RESET}"
     host_txt = "executing" if state == "working" else "idle"
     clock = time.strftime("%H:%M:%S")
     left_v = "  Codex  bridge"
     left_a = f"  {BOLD}{a2}Codex{RESET}{mute}  bridge{RESET}"
     hold_hint = "  confirming" if confirming else ""
-    right_v = f"{host_txt}  {clock}  "
+    right_v = f"{dot_v} {host_txt}{hold_hint}  {clock}  "
     right_a = f"{dot} {mute}{host_txt}{RESET}{faint}{hold_hint}{RESET}  {faint}{clock}{RESET}  "
     mid_pad = inner - dwidth(left_v) - dwidth(right_v)
     if mid_pad < 1:
@@ -434,7 +437,9 @@ def render_dashboard(state, rows, error, confirming):
     header_a = left_a + (" " * mid_pad) + right_a
     header_v = left_v + (" " * mid_pad) + right_v
 
-    badge_v = f"  {glyph} {label} "
+    # Leading space inside the color block is intentional padding; keep it in
+    # badge_v so row() width matches the painted line.
+    badge_v = f"   {glyph} {label} "
     badge_a = f"  {bg(color)}{fg(16)}{BOLD} {glyph} {label} {RESET}"
     lines = [
         top,

@@ -259,7 +259,7 @@ const CODEBUDDY_REMOVED_LIFECYCLE_HOOK_EVENTS: [(&str, &str); 4] = [
 /// pane.
 const WORKBUDDY_WATCH_INSTALL_NAME: &str = "herdr-workbuddy-watch.sh";
 const WORKBUDDY_WATCH_ASSET: &str = include_str!("assets/workbuddy/herdr-workbuddy-watch.sh");
-const WORKBUDDY_INTEGRATION_VERSION: u32 = 7;
+const WORKBUDDY_INTEGRATION_VERSION: u32 = 8;
 /// Skip the bridge-pane auto-spawn (test seam; also honored for users who
 /// only want the watcher script installed).
 const WORKBUDDY_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_WORKBUDDY_NO_AUTOSPAWN";
@@ -269,7 +269,7 @@ const WORKBUDDY_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_WORKBUDDY_NO_AUTOSPAWN";
 /// distinct from `Agent::Codex`, which detects the Codex CLI inside a pane.
 const CODEXAPP_WATCH_INSTALL_NAME: &str = "herdr-codexapp-watch.sh";
 const CODEXAPP_WATCH_ASSET: &str = include_str!("assets/codexapp/herdr-codexapp-watch.sh");
-const CODEXAPP_INTEGRATION_VERSION: u32 = 2;
+const CODEXAPP_INTEGRATION_VERSION: u32 = 3;
 /// Skip the bridge-pane auto-spawn (test seam; also honored for users who
 /// only want the watcher script installed).
 const CODEXAPP_NO_AUTOSPAWN_ENV_VAR: &str = "HERDR_CODEXAPP_NO_AUTOSPAWN";

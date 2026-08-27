@@ -2,10 +2,12 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import tempfile
 import time
+import unicodedata
 import unittest
 
 
@@ -13,6 +15,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WATCHER = REPO_ROOT / "src/integration/assets/workbuddy/herdr-workbuddy-watch.sh"
 SESSION_ID = "11111111-2222-3333-4444-555555555555"
 SESSION_CWD = "/tmp/workbuddy-project"
+DASHBOARD_WIDTH = 94
+CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_csi(text: str) -> str:
+    return CSI_RE.sub("", text)
+
+
+def display_width(text: str) -> int:
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
 
 
 class WorkbuddyIntegrationAssetTests(unittest.TestCase):
@@ -114,10 +131,10 @@ class WorkbuddyIntegrationAssetTests(unittest.TestCase):
             0,
             f"stdout={process.stdout!r} stderr={process.stderr!r}",
         )
-        return json.loads(state_file.read_text(encoding="utf-8"))
+        return json.loads(state_file.read_text(encoding="utf-8")), process.stdout
 
     def _reported_state(self):
-        return self._run_watcher_once()["reported"].split(":", 1)[0]
+        return self._run_watcher_once()[0]["reported"].split(":", 1)[0]
 
     def test_in_flight_turn_reports_working_while_its_host_lives(self):
         self._write_host()
@@ -153,8 +170,21 @@ class WorkbuddyIntegrationAssetTests(unittest.TestCase):
 
     def test_missing_database_reports_idle(self):
         (self.workbuddy_home / "workbuddy.db").unlink()
-        state = self._run_watcher_once()
+        state, _stdout = self._run_watcher_once()
         self.assertEqual(state["reported"], "idle:WorkBuddy database not found")
+
+    def test_dashboard_rows_share_one_border_width(self):
+        # Regression: header right_a used to include ● / hold_hint while
+        # right_v omitted them, so row() padding shoved the right border out.
+        self._write_host()
+        _state, stdout = self._run_watcher_once()
+        lines = [line for line in strip_csi(stdout).splitlines() if line]
+        self.assertGreaterEqual(len(lines), 3)
+        widths = [display_width(line) for line in lines]
+        self.assertTrue(
+            all(width == DASHBOARD_WIDTH for width in widths),
+            f"border widths={widths} lines={lines[:4]!r}",
+        )
 
 
 if __name__ == "__main__":

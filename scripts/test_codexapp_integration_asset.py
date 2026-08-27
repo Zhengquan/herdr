@@ -2,15 +2,32 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import tempfile
 import time
+import unicodedata
 import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WATCHER = REPO_ROOT / "src/integration/assets/codexapp/herdr-codexapp-watch.sh"
+DASHBOARD_WIDTH = 94
+CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_csi(text: str) -> str:
+    return CSI_RE.sub("", text)
+
+
+def display_width(text: str) -> int:
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
 
 
 class CodexAppIntegrationAssetTests(unittest.TestCase):
@@ -79,10 +96,10 @@ class CodexAppIntegrationAssetTests(unittest.TestCase):
             0,
             f"stdout={process.stdout!r} stderr={process.stderr!r}",
         )
-        return json.loads(state_file.read_text(encoding="utf-8"))
+        return json.loads(state_file.read_text(encoding="utf-8")), process.stdout
 
     def test_stale_rollout_stays_working_until_terminal_lifecycle_event(self):
-        state = self._run_watcher_once()
+        state, _stdout = self._run_watcher_once()
         self.assertEqual(state["reported"].split(":", 1)[0], "working")
 
         terminal_event = json.dumps({"payload": {"type": "task_complete"}})
@@ -92,15 +109,26 @@ class CodexAppIntegrationAssetTests(unittest.TestCase):
         self._make_rollout_stale()
 
         # A poll racing a partial JSONL append must not consume and lose it.
-        state = self._run_watcher_once()
+        state, _stdout = self._run_watcher_once()
         self.assertEqual(state["reported"].split(":", 1)[0], "working")
 
         with self.rollout.open("a", encoding="utf-8") as handle:
             handle.write(terminal_event[midpoint:] + "\n")
         self._make_rollout_stale()
 
-        state = self._run_watcher_once()
+        state, _stdout = self._run_watcher_once()
         self.assertEqual(state["reported"].split(":", 1)[0], "idle")
+
+    def test_dashboard_rows_share_one_border_width(self):
+        # Same header right_v/right_a mismatch as the WorkBuddy bridge.
+        _state, stdout = self._run_watcher_once()
+        lines = [line for line in strip_csi(stdout).splitlines() if line]
+        self.assertGreaterEqual(len(lines), 3)
+        widths = [display_width(line) for line in lines]
+        self.assertTrue(
+            all(width == DASHBOARD_WIDTH for width in widths),
+            f"border widths={widths} lines={lines[:4]!r}",
+        )
 
 
 if __name__ == "__main__":
