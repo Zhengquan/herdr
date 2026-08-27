@@ -2123,7 +2123,8 @@
             "antigravity_cli",
             "grok",
             "codebuddy",
-            "workbuddy"
+            "workbuddy",
+            "codexapp"
           ],
           "type": "string"
         },
@@ -7181,7 +7182,8 @@
             "antigravity_cli",
             "grok",
             "codebuddy",
-            "workbuddy"
+            "workbuddy",
+            "codexapp"
           ],
           "type": "string"
         },
