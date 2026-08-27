@@ -29,6 +29,8 @@ herdr integration install qwen
 herdr integration install cursor
 herdr integration install antigravity-cli
 herdr integration install grok
+herdr integration install codebuddy
+herdr integration install workbuddy
 ```
 
 ## インテグレーションをアンインストールする
@@ -51,6 +53,8 @@ herdr integration uninstall qwen
 herdr integration uninstall cursor
 herdr integration uninstall antigravity-cli
 herdr integration uninstall grok
+herdr integration uninstall codebuddy
+herdr integration uninstall workbuddy
 ```
 
 ## Herdr がインテグレーションをどう使うか
@@ -59,7 +63,7 @@ Herdr はインテグレーションを 2 つの異なる方法で使います:
 
 | インテグレーションの種類 | エージェント | 効果 |
 | --- | --- | --- |
-| ライフサイクル権威 | Pi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode | インストールされ、そのペインについて能動的に報告している間は、フックまたはプラグインのイベントが `idle`、`working`、`blocked` を決定します。同じライフサイクル権威に対して、Herdr はスクリーンマニフェストのフォールバックを併用しません。 |
+| ライフサイクル権威 | Pi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode、CodeBuddy、WorkBuddy（ブリッジ watcher） | インストールされ、そのペインについて能動的に報告している間は、フックまたはプラグインのイベントが `idle`、`working`、`blocked` を決定します。同じライフサイクル権威に対して、Herdr はスクリーンマニフェストのフォールバックを併用しません。 |
 | セッション識別 | Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Qoder CLI、Qwen Code、Cursor Agent CLI、Hermes Agent、Antigravity CLI、Grok CLI | インテグレーションは復元用のネイティブセッション参照を報告します。状態は引き続き Herdr のスクリーンマニフェスト検出から得られます。 |
 
 カスタムインテグレーションも、ネイティブのターミナル UI では見えない状態を定義する場合に状態を報告できます。Herdr への組み込みや、認識済みのエージェント実行ファイルは必要ありません。
@@ -330,6 +334,32 @@ herdr integration install grok
 Herdr はデフォルトで `~/.grok` を使い、`GROK_HOME` が設定されていればそちらを使います。Grok の設定ディレクトリはあらかじめ存在している必要があります。Grok はそのディレクトリ内のすべての `hooks/*.json` ファイルを統合するため、インストールは Herdr の `SessionStart` エントリだけを含む `hooks/herdr.json` と `hooks/herdr-agent-state.sh`（Windows では `hooks/herdr-agent-state.ps1`）を書き込み、ほかのフックファイルには触れません。アンインストールは Herdr 所有のこの 2 ファイルだけを削除します。
 
 Grok がセッション開始イベントを発行した後、Herdr は報告されたセッション id を使って `grok --resume <id>` でペインを resume できます。
+
+## CodeBuddy
+
+CodeBuddy フックをインストールします:
+
+```bash
+herdr integration install codebuddy
+```
+
+CodeBuddy フックは、ほかのインテグレーションと同じローカル socket API を通じてセッション識別とライフサイクル状態を報告します。インストールされている間、このフックが `idle`、`working`、`blocked` のライフサイクル権威になります。その権威に対して、Herdr はスクリーンマニフェストのフォールバックを併用しません。
+
+Herdr はデフォルトで `~/.codebuddy` を使い、`CODEBUDDY_HOME` が設定されていればそちらを使います。CodeBuddy の設定ディレクトリはあらかじめ存在している必要があります。インストールは `hooks/herdr-agent-state.sh`（Windows では `hooks/herdr-agent-state.ps1`）を書き込み、`settings.json` のフックを更新し、`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`Stop`、`Notification` のエントリを登録します。アンインストールは `settings.json` から Herdr のエントリを削除し、フックスクリプトを削除します。
+
+CodeBuddy がセッション情報を含むイベントを発行した後、Herdr は報告されたセッション id を使って `codebuddy --resume <id>` でペインを resume できます。
+
+## WorkBuddy
+
+WorkBuddy は単体の macOS デスクトップアプリです。Herdr のペイン内では決して動かないため、プロセス検出、スクリーンマニフェスト、フックベースのインテグレーションでは観測できません。そこで WorkBuddy インテグレーションは、代わりにブリッジ watcher をインストールします:
+
+```bash
+herdr integration install workbuddy
+```
+
+インストールは `~/.workbuddy/herdr/herdr-workbuddy-watch.sh` を書き込み、Herdr サーバーが動いている場合は "WorkBuddy" ワークスペースを自動的に作成してそのルートペインで watcher を起動します。watcher は WorkBuddy のローカル状態を読み取り専用でポーリングし（セッション一覧はセッションデータベース、ターンのライフサイクルは会話トランスクリプトから取得）、集約した状態を socket API 経由で報告します（いずれかのセッションでターンが進行中なら `working`、すべてのターンが終わっていれば `idle`、ステータスメッセージは現在のタスクタイトル）。`HERDR_WORKBUDDY_NO_AUTOSPAWN=1` を設定するとスクリプトだけをインストールし、その後どの Herdr ペインでも `sh ~/.workbuddy/herdr/herdr-workbuddy-watch.sh` を実行してブリッジを手動で起動できます。
+
+1 つのブリッジペインは個々のセッションではなく WorkBuddy アプリ全体を表します。アンインストールは watcher スクリプトを削除し、動作中のブリッジは次のポーリングでそれに気づいて終了します。
 
 ## カスタムステータスラベル
 

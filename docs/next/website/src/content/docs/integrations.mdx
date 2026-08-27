@@ -339,7 +339,6 @@ Install the CodeBuddy hook:
 
 ```bash
 herdr integration install codebuddy
-herdr integration install workbuddy
 ```
 
 The CodeBuddy hook reports session identity and lifecycle state through the same local socket API used by other integrations. When installed, the hook is the lifecycle authority for `idle`, `working`, and `blocked`; Herdr does not also use screen manifest fallback for that authority.

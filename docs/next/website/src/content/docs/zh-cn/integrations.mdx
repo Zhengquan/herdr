@@ -29,6 +29,8 @@ herdr integration install qwen
 herdr integration install cursor
 herdr integration install antigravity-cli
 herdr integration install grok
+herdr integration install codebuddy
+herdr integration install workbuddy
 ```
 
 ## 卸载集成
@@ -51,6 +53,8 @@ herdr integration uninstall qwen
 herdr integration uninstall cursor
 herdr integration uninstall antigravity-cli
 herdr integration uninstall grok
+herdr integration uninstall codebuddy
+herdr integration uninstall workbuddy
 ```
 
 ## Herdr 如何使用集成
@@ -59,7 +63,7 @@ Herdr 以两种不同方式使用集成:
 
 | 集成类型 | 智能体 | 效果 |
 | --- | --- | --- |
-| 生命周期权威 | Pi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode | 已安装且在为该窗格主动上报时,由钩子或插件事件决定 `idle`、`working` 和 `blocked`。对同一个生命周期权威,Herdr 不再使用屏幕清单兜底。 |
+| 生命周期权威 | Pi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode、CodeBuddy、WorkBuddy（桥接 watcher） | 已安装且在为该窗格主动上报时,由钩子或插件事件决定 `idle`、`working` 和 `blocked`。对同一个生命周期权威,Herdr 不再使用屏幕清单兜底。 |
 | 会话身份 | Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Qoder CLI、Qwen Code、Cursor Agent CLI、Hermes Agent、Antigravity CLI、Grok CLI | 集成上报用于恢复的原生会话引用。状态仍来自 Herdr 的屏幕清单检测。 |
 
 自定义集成在定义了原生终端 UI 中不可见的状态时,也可以上报状态。它们不需要内置到 Herdr 中,也不要求 Herdr 识别智能体的可执行文件。
@@ -330,6 +334,32 @@ herdr integration install grok
 Herdr 默认使用 `~/.grok`,设置了 `GROK_HOME` 时使用后者。Grok 配置目录必须已经存在。Grok 会合并该目录中的所有 `hooks/*.json` 文件,因此安装会写入独立的 `hooks/herdr.json`,其中包含 Herdr 的 `SessionStart` 条目,并同时写入 `hooks/herdr-agent-state.sh`（Windows 上为 `hooks/herdr-agent-state.ps1`）;它不会修改其他钩子文件。卸载只会删除这两个由 Herdr 管理的文件。
 
 Grok 发出会话启动事件后,Herdr 可以用上报的会话 id 通过 `grok --resume <id>` 恢复窗格。
+
+## CodeBuddy
+
+安装 CodeBuddy 钩子:
+
+```bash
+herdr integration install codebuddy
+```
+
+CodeBuddy 钩子通过其他集成同样使用的本地 socket API 上报会话身份和生命周期状态。安装后,该钩子就是 `idle`、`working` 和 `blocked` 的生命周期权威;对该权威,Herdr 不再使用屏幕清单兜底。
+
+Herdr 默认使用 `~/.codebuddy`,设置了 `CODEBUDDY_HOME` 时使用后者。CodeBuddy 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`（Windows 上为 `hooks/herdr-agent-state.ps1`）、更新 `settings.json` 中的钩子,并注册 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`Stop` 和 `Notification` 条目。卸载会从 `settings.json` 中移除 Herdr 的条目并删除钩子脚本。
+
+CodeBuddy 发出带会话信息的事件后,Herdr 可以用上报的会话 id 通过 `codebuddy --resume <id>` 恢复窗格。
+
+## WorkBuddy
+
+WorkBuddy 是独立的 macOS 桌面应用:它从不运行在 Herdr 窗格内,因此进程检测、屏幕清单和基于钩子的集成都观察不到它。WorkBuddy 集成改为安装一个桥接 watcher:
+
+```bash
+herdr integration install workbuddy
+```
+
+安装会写入 `~/.workbuddy/herdr/herdr-workbuddy-watch.sh`;当 Herdr 服务器正在运行时,还会自动创建一个 "WorkBuddy" 工作区并在其根窗格中启动该 watcher。watcher 只读轮询 WorkBuddy 的本地状态——会话数据库提供会话列表,对话轨迹提供轮次生命周期——并通过 socket API 上报聚合状态（任一会话有轮次在进行时为 `working`,所有轮次结束后为 `idle`,状态消息为当前任务标题）。设置 `HERDR_WORKBUDDY_NO_AUTOSPAWN=1` 只安装脚本,之后在任意 Herdr 窗格中运行 `sh ~/.workbuddy/herdr/herdr-workbuddy-watch.sh` 手动启动桥接。
+
+一个桥接窗格代表整个 WorkBuddy 应用,而不是单个会话。卸载会删除 watcher 脚本;正在运行的桥接会在下一次轮询时发现并退出。
 
 ## 自定义状态标签
 
