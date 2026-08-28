@@ -357,7 +357,7 @@ WorkBuddy は単体の macOS デスクトップアプリです。Herdr のペイ
 herdr integration install workbuddy
 ```
 
-インストールは `~/.workbuddy/herdr/herdr-workbuddy-watch.sh` を書き込み、Herdr サーバーが動いている場合は "WorkBuddy" ワークスペースを自動的に作成してそのルートペインで watcher を起動します。watcher は WorkBuddy のローカル状態を読み取り専用でポーリングし（セッション一覧はセッションデータベース、ターンのライフサイクルは会話トランスクリプトから取得）、集約した状態を socket API 経由で報告します（いずれかのセッションでターンが進行中なら `working`、すべてのターンが終わっていれば `idle`、ステータスメッセージは現在のタスクタイトル）。`HERDR_WORKBUDDY_NO_AUTOSPAWN=1` を設定するとスクリプトだけをインストールし、その後どの Herdr ペインでも `sh ~/.workbuddy/herdr/herdr-workbuddy-watch.sh` を実行してブリッジを手動で起動できます。
+インストールは `~/.workbuddy/herdr/herdr-workbuddy-watch.sh` を書き込み、Herdr サーバーが動いている場合は "WorkBuddy" ワークスペースを自動的に作成してそのルートペインで watcher を起動します。watcher は WorkBuddy のローカル状態を読み取り専用でポーリングし（セッション一覧はセッションデータベース、ターンのライフサイクルは会話トランスクリプトから取得）、集約した状態を socket API 経由で報告します（いずれかのセッションがユーザーの回答待ちなら `blocked`、ほかのセッションでターンが進行中なら `working`、すべてのターンが終わっていれば `idle`、ステータスメッセージは現在のタスクタイトル）。`HERDR_WORKBUDDY_NO_AUTOSPAWN=1` を設定するとスクリプトだけをインストールし、その後どの Herdr ペインでも `sh ~/.workbuddy/herdr/herdr-workbuddy-watch.sh` を実行してブリッジを手動で起動できます。
 
 1 つのブリッジペインは個々のセッションではなく WorkBuddy アプリ全体を表します。アンインストールは watcher スクリプトを削除し、動作中のブリッジは次のポーリングでそれに気づいて終了します。
 

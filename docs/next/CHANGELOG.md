@@ -23,6 +23,7 @@
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 
 ### Fixed
+- The WorkBuddy bridge now reports unanswered questions as blocked, so tasks waiting for user interaction raise an attention notification instead of appearing to keep working.
 - The Codex App bridge now keeps turns working through long tool calls with no rollout writes and only marks them complete after an explicit terminal lifecycle event.
 - Herdr no longer sends the full OSC 4 palette query burst under WSL, preventing reply fragments from leaking into the shell through ConPTY. (#2440)
 - Qwen Code panes now use locale-independent terminal-title states and localized confirmation fallbacks, preventing active or blocked turns from appearing idle. (#2756)

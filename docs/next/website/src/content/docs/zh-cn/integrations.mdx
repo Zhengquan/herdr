@@ -357,7 +357,7 @@ WorkBuddy 是独立的 macOS 桌面应用:它从不运行在 Herdr 窗格内,因
 herdr integration install workbuddy
 ```
 
-安装会写入 `~/.workbuddy/herdr/herdr-workbuddy-watch.sh`;当 Herdr 服务器正在运行时,还会自动创建一个 "WorkBuddy" 工作区并在其根窗格中启动该 watcher。watcher 只读轮询 WorkBuddy 的本地状态——会话数据库提供会话列表,对话轨迹提供轮次生命周期——并通过 socket API 上报聚合状态（任一会话有轮次在进行时为 `working`,所有轮次结束后为 `idle`,状态消息为当前任务标题）。设置 `HERDR_WORKBUDDY_NO_AUTOSPAWN=1` 只安装脚本,之后在任意 Herdr 窗格中运行 `sh ~/.workbuddy/herdr/herdr-workbuddy-watch.sh` 手动启动桥接。
+安装会写入 `~/.workbuddy/herdr/herdr-workbuddy-watch.sh`;当 Herdr 服务器正在运行时,还会自动创建一个 "WorkBuddy" 工作区并在其根窗格中启动该 watcher。watcher 只读轮询 WorkBuddy 的本地状态——会话数据库提供会话列表,对话轨迹提供轮次生命周期——并通过 socket API 上报聚合状态（任一会话正在等待用户回答时为 `blocked`,其他会话有轮次在进行时为 `working`,所有轮次结束后为 `idle`,状态消息为当前任务标题）。设置 `HERDR_WORKBUDDY_NO_AUTOSPAWN=1` 只安装脚本,之后在任意 Herdr 窗格中运行 `sh ~/.workbuddy/herdr/herdr-workbuddy-watch.sh` 手动启动桥接。
 
 一个桥接窗格代表整个 WorkBuddy 应用,而不是单个会话。卸载会删除 watcher 脚本;正在运行的桥接会在下一次轮询时发现并退出。
 

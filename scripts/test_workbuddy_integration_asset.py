@@ -136,11 +136,56 @@ class WorkbuddyIntegrationAssetTests(unittest.TestCase):
     def _reported_state(self):
         return self._run_watcher_once()[0]["reported"].split(":", 1)[0]
 
+    def _append_pending_question(self):
+        self._append(
+            {
+                "type": "function_call_result",
+                "name": "Bash",
+                "status": "completed",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+            },
+            {"type": "function_call", "name": "AskUserQuestion"},
+        )
+
     def test_in_flight_turn_reports_working_while_its_host_lives(self):
         self._write_host()
         # A tool call can run for minutes without a transcript write.
         self._age_transcript(120)
         self.assertEqual(self._reported_state(), "working")
+
+    def test_pending_question_reports_blocked_immediately_from_working(self):
+        self._write_host()
+        self.assertEqual(self._reported_state(), "working")
+
+        self._append_pending_question()
+        state, stdout = self._run_watcher_once()
+
+        self.assertEqual(state["reported"].split(":", 1)[0], "blocked")
+        self.assertIn("BLOCKED", strip_csi(stdout))
+        self.assertIn("blocked", strip_csi(stdout))
+
+    def test_answered_question_returns_to_working(self):
+        self._write_host()
+        self._append_pending_question()
+        self.assertEqual(self._reported_state(), "blocked")
+
+        self._append(
+            {
+                "type": "function_call_result",
+                "name": "AskUserQuestion",
+                "status": "completed",
+            }
+        )
+        self.assertEqual(self._reported_state(), "working")
+
+    def test_abandoned_question_does_not_stay_blocked(self):
+        self._append_pending_question()
+        self._age_transcript(600)
+        self.assertEqual(self._reported_state(), "idle")
 
     def test_turn_end_needs_to_settle_before_it_confirms_completion(self):
         self._write_host()

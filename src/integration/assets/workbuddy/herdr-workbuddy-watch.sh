@@ -73,6 +73,10 @@ NOW_MS = NOW * 1000
 #   assistant text block is written as a completed `message`, so only the
 #   LAST record in the file distinguishes a finished turn from a mid-turn
 #   narration that is about to be followed by another tool call.
+# * WorkBuddy writes an `AskUserQuestion` function call before it pauses for
+#   user input and appends the matching result only after the user responds.
+#   An unanswered call at the transcript tail is therefore a blocked turn,
+#   not ordinary in-flight work.
 # * ~/.workbuddy/sessions/<pid>.json is a per-host heartbeat carrying the
 #   conversation id it serves. It is not an execution signal — a host stays
 #   alive while its conversation sits idle — but a missing host proves the
@@ -81,6 +85,8 @@ NOW_MS = NOW * 1000
 # ---------------------------------------------------------------------------
 IN_FLIGHT = "in_flight"
 TURN_END = "turn_end"
+WAITING_USER = "waiting_user"
+USER_INTERACTION_TOOLS = {"AskUserQuestion"}
 DB_FAILED_STATUSES = {"failed", "error"}
 DB_STOPPED_STATUSES = {"terminated", "cancelled"}
 TRANSCRIPT_FRESH_S = 45     # no readable turn record: treat fresh writes as work
@@ -249,8 +255,9 @@ def turn_state(session_id, cwd):
     """Return (kind, message_status, age_seconds) for a session's last turn.
 
     `kind` is TURN_END once the transcript's last record is an assistant
-    message, IN_FLIGHT while any other record is last, and None when no
-    transcript record can be read.
+    message, WAITING_USER for an unanswered user-interaction call, IN_FLIGHT
+    while any other record is last, and None when no transcript record can be
+    read.
     """
     if session_id in turn_states:
         return turn_states[session_id]
@@ -264,6 +271,11 @@ def turn_state(session_id, cwd):
             if record.get("type") == "message" and record.get("role") == "assistant":
                 kind = TURN_END
                 status = str(record.get("status") or "").lower()
+            elif (
+                record.get("type") == "function_call"
+                and record.get("name") in USER_INTERACTION_TOOLS
+            ):
+                kind = WAITING_USER
             else:
                 kind = IN_FLIGHT
     result = (kind, status, age)
@@ -275,7 +287,7 @@ def session_active(row, live_hosts):
     """True while a session's transcript shows a turn still in flight."""
     session_id = row[0]
     kind, _status, age = turn_state(session_id, row[5])
-    if kind == TURN_END:
+    if kind in (TURN_END, WAITING_USER):
         return False
     if kind == IN_FLIGHT:
         if session_id in live_hosts:
@@ -284,6 +296,17 @@ def session_active(row, live_hosts):
             return True
         return age is not None and age < ABANDONED_TURN_S
     return age is not None and age < TRANSCRIPT_FRESH_S
+
+
+def session_blocked(row, live_hosts):
+    """True while a live or freshly written turn is waiting for user input."""
+    session_id = row[0]
+    kind, _status, age = turn_state(session_id, row[5])
+    if kind != WAITING_USER:
+        return False
+    if session_id in live_hosts:
+        return True
+    return age is not None and age < ABANDONED_TURN_S
 
 
 def age_ms(value):
@@ -338,6 +361,7 @@ STATE_THEME = {
 
 ROW_ICONS = {
     "running": ("▶", C_GREEN, "running"),
+    "blocked": ("■", C_RED, "blocked"),
     "done": ("✓", C_MUTE, "done"),
     "failed": ("✕", C_RED, "failed"),
     "stopped": ("⊘", C_AMBER, "stopped"),
@@ -347,6 +371,8 @@ ROW_ICONS = {
 
 def row_badge(row, live_hosts):
     """Pick the STATUS column glyph for a session row."""
+    if session_blocked(row, live_hosts):
+        return ROW_ICONS["blocked"]
     if session_active(row, live_hosts):
         return ROW_ICONS["running"]
     db_status = str(row[1] or "").lower()
@@ -497,8 +523,12 @@ def render_dashboard(state, rows, error, live, confirming, live_hosts):
     lines.append(row(0, ""))
     total = len(rows)
     running = sum(1 for r in rows if session_active(r, live_hosts)) if rows else 0
-    foot_v = f"  {total} sessions · {running} active · poll {POLL_HINT}s"
-    foot_a = f"  {faint}{total} sessions · {running} active · poll {POLL_HINT}s{RESET}"
+    blocked = sum(1 for r in rows if session_blocked(r, live_hosts)) if rows else 0
+    foot_v = f"  {total} sessions · {running} active · {blocked} blocked · poll {POLL_HINT}s"
+    foot_a = (
+        f"  {faint}{total} sessions · {running} active · {blocked} blocked · "
+        f"poll {POLL_HINT}s{RESET}"
+    )
     lines.append(sep)
     lines.append(row(dwidth(foot_v), foot_a))
     lines.append(bot)
@@ -528,6 +558,7 @@ except Exception:
 tracked_id = persisted.get("tracked_id")
 last_active_seen_ms = persisted.get("last_active_seen_ms")
 
+blocked = next((r for r in rows if session_blocked(r, live_hosts)), None)
 active = next((r for r in rows if session_active(r, live_hosts)), None)
 tracked = next((r for r in rows if r[0] == tracked_id), None) if tracked_id else None
 confirming = False
@@ -535,6 +566,12 @@ confirmed_completion = False
 
 if error:
     state, message = ("idle", error)
+elif blocked is not None:
+    # User interaction takes priority over concurrent work so the aggregate
+    # bridge state always raises the attention notification.
+    tracked_id = blocked[0]
+    last_active_seen_ms = NOW_MS
+    state, message = ("blocked", short_title(blocked[2]))
 elif active is not None:
     # A turn is genuinely in flight: track it and report working.
     tracked_id = active[0]
@@ -547,6 +584,11 @@ elif tracked is not None:
         # has stopped being followed by tool calls, so the turn really is over.
         # Produce the working→idle transition that fires the Done sound once.
         confirmed_completion = True
+        state, message = ("idle", short_title(tracked[2]))
+        tracked_id = None
+    elif kind == WAITING_USER:
+        # A question with no live host and no recent transcript activity is
+        # abandoned, not work that needs completion confirmation.
         state, message = ("idle", short_title(tracked[2]))
         tracked_id = None
     elif last_active_seen_ms and (NOW_MS - last_active_seen_ms) < HOLD_WORKING_S * 1000:
@@ -594,7 +636,9 @@ elif candidate == reported:
     persisted.pop("candidate", None)
     persisted.pop("candidate_count", None)
 else:
-    if state == "working":
+    if state in ("working", "blocked"):
+        # Enter work and user-attention states on the first observation. In
+        # particular, working→blocked must not inherit leave-working dwell.
         needed = ENTER_WORKING_POLLS
     elif confirmed_completion:
         # A genuine completion: report promptly so the Done sound is not
