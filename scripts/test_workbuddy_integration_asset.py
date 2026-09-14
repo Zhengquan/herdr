@@ -102,6 +102,23 @@ class WorkbuddyIntegrationAssetTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _insert_newer_sessions(self, count):
+        with closing(sqlite3.connect(self.workbuddy_home / "workbuddy.db")) as database:
+            now_ms = int(time.time() * 1000)
+            for index in range(count):
+                database.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                    (
+                        f"newer-session-{index}",
+                        "completed",
+                        f"newer task {index}",
+                        now_ms + index + 1,
+                        now_ms + index + 1,
+                        SESSION_CWD,
+                    ),
+                )
+            database.commit()
+
     def _run_watcher_once(self):
         state_file = self.base / "herdr-workbuddy-watch.p_test.state"
         env = os.environ.copy()
@@ -167,6 +184,18 @@ class WorkbuddyIntegrationAssetTests(unittest.TestCase):
         self.assertEqual(state["reported"].split(":", 1)[0], "blocked")
         self.assertIn("BLOCKED", strip_csi(stdout))
         self.assertIn("blocked", strip_csi(stdout))
+
+    def test_live_pending_question_outside_dashboard_window_reports_blocked(self):
+        self._insert_newer_sessions(20)
+        self._write_host()
+        self._append_pending_question()
+
+        state, stdout = self._run_watcher_once()
+        visible = strip_csi(stdout)
+
+        self.assertEqual(state["reported"].split(":", 1)[0], "blocked")
+        self.assertIn("20 sessions · 0 active · 1 blocked", visible)
+        self.assertNotIn("21 sessions", visible)
 
     def test_answered_question_returns_to_working(self):
         self._write_host()

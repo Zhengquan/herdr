@@ -122,11 +122,16 @@ def send(method, params):
         pass
 
 
-def load_sessions():
-    """Return (error_or_None, rows) where each row is
-    (id, status, title, last_activity_at, updated_at, cwd)."""
+def load_sessions(watched_ids):
+    """Return (error_or_None, display_rows, watched_rows).
+
+    The dashboard stays bounded to the 20 most recently updated database rows.
+    State aggregation additionally includes live or previously tracked
+    sessions because WorkBuddy does not reliably refresh a resumed session's
+    database ordering before it pauses for user interaction.
+    """
     if not os.path.isfile(db_path):
-        return ("WorkBuddy database not found", [])
+        return ("WorkBuddy database not found", [], [])
     try:
         db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         rows = db.execute(
@@ -134,10 +139,22 @@ def load_sessions():
             "WHERE deleted_at IS NULL AND status != 'archived' "
             "ORDER BY updated_at DESC LIMIT 20"
         ).fetchall()
+        watched_rows = list(rows)
+        missing_ids = sorted(set(watched_ids) - {str(row[0]) for row in rows})
+        if missing_ids:
+            placeholders = ",".join("?" for _ in missing_ids)
+            watched_rows.extend(
+                db.execute(
+                    "SELECT id, status, title, last_activity_at, updated_at, cwd "
+                    "FROM sessions WHERE deleted_at IS NULL AND status != 'archived' "
+                    f"AND id IN ({placeholders})",
+                    missing_ids,
+                ).fetchall()
+            )
         db.close()
-        return (None, rows)
+        return (None, rows, watched_rows)
     except Exception:
-        return ("WorkBuddy database unreadable", [])
+        return ("WorkBuddy database unreadable", [], [])
 
 
 def load_hosts():
@@ -438,7 +455,7 @@ COL_STATUS = 11
 COL_WHEN = 7
 
 
-def render_dashboard(state, rows, error, live, confirming, live_hosts):
+def render_dashboard(state, rows, state_rows, error, live, confirming, live_hosts):
     color, label, glyph = STATE_THEME.get(state, STATE_THEME["idle"])
     accent = fg(C_ACCENT)
     a2 = fg(C_ACCENT2)
@@ -522,8 +539,12 @@ def render_dashboard(state, rows, error, live, confirming, live_hosts):
 
     lines.append(row(0, ""))
     total = len(rows)
-    running = sum(1 for r in rows if session_active(r, live_hosts)) if rows else 0
-    blocked = sum(1 for r in rows if session_blocked(r, live_hosts)) if rows else 0
+    running = (
+        sum(1 for r in state_rows if session_active(r, live_hosts)) if state_rows else 0
+    )
+    blocked = (
+        sum(1 for r in state_rows if session_blocked(r, live_hosts)) if state_rows else 0
+    )
     foot_v = f"  {total} sessions · {running} active · {blocked} blocked · poll {POLL_HINT}s"
     foot_a = (
         f"  {faint}{total} sessions · {running} active · {blocked} blocked · "
@@ -543,11 +564,8 @@ POLL_HINT = os.environ.get("HERDR_WORKBUDDY_POLL_INTERVAL", "3")
 # ===========================================================================
 # Aggregate with completion confirmation
 # ===========================================================================
-error, rows = load_sessions()
 live_hosts = load_hosts()
 live = bool(live_hosts)
-if rows:
-    rows.sort(key=effective_age_s)
 
 try:
     with open(state_file, encoding="utf-8") as handle:
@@ -556,11 +574,22 @@ except Exception:
     persisted = {}
 
 tracked_id = persisted.get("tracked_id")
+watched_ids = set(live_hosts)
+if tracked_id:
+    watched_ids.add(str(tracked_id))
+error, rows, watched_rows = load_sessions(watched_ids)
+if rows:
+    rows.sort(key=effective_age_s)
+if watched_rows:
+    watched_rows.sort(key=effective_age_s)
+
 last_active_seen_ms = persisted.get("last_active_seen_ms")
 
-blocked = next((r for r in rows if session_blocked(r, live_hosts)), None)
-active = next((r for r in rows if session_active(r, live_hosts)), None)
-tracked = next((r for r in rows if r[0] == tracked_id), None) if tracked_id else None
+blocked = next((r for r in watched_rows if session_blocked(r, live_hosts)), None)
+active = next((r for r in watched_rows if session_active(r, live_hosts)), None)
+tracked = (
+    next((r for r in watched_rows if r[0] == tracked_id), None) if tracked_id else None
+)
 confirming = False
 confirmed_completion = False
 
@@ -607,7 +636,7 @@ else:
     state, message = ("idle", short_title(fallback_title) if fallback_title else None)
     tracked_id = None
 
-render_dashboard(state, rows, error, live, confirming, live_hosts)
+render_dashboard(state, rows, watched_rows, error, live, confirming, live_hosts)
 
 candidate = f"{state}:{message or ''}"
 reported = persisted.get("reported")
