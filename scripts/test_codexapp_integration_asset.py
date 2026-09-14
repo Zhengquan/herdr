@@ -47,6 +47,10 @@ class CodexAppIntegrationAssetTests(unittest.TestCase):
                 "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?)",
                 ("active-thread", "long tool call", "vscode", time.time()),
             )
+            database.execute(
+                "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?)",
+                ("chatgpt-thread", "web conversation", "chatgpt", time.time() + 60),
+            )
             database.commit()
 
         rollout_dir = self.codex_home / "sessions/2026/08/23"
@@ -118,6 +122,15 @@ class CodexAppIntegrationAssetTests(unittest.TestCase):
 
         state, _stdout = self._run_watcher_once()
         self.assertEqual(state["reported"].split(":", 1)[0], "idle")
+
+    def test_dashboard_excludes_chatgpt_conversations(self):
+        state, stdout = self._run_watcher_once()
+        visible = strip_csi(stdout)
+        self.assertEqual(state["reported"], "working:long tool call")
+        self.assertIn("long tool call [vscode]", visible)
+        self.assertIn("1 threads · 1 active", visible)
+        self.assertNotIn("web conversation", visible)
+        self.assertNotIn("[chatgpt]", visible)
 
     def test_dashboard_rows_share_one_border_width(self):
         # Same header right_v/right_a mismatch as the WorkBuddy bridge.

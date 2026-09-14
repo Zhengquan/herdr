@@ -139,6 +139,7 @@ def load_threads():
             "SELECT thread_id, display_title, source_kind, source_updated_at "
             "FROM local_thread_catalog "
             "WHERE source_updated_at IS NOT NULL "
+            "AND source_kind != 'chatgpt' "
             "ORDER BY source_updated_at DESC LIMIT 20"
         ).fetchall()
         db.close()
